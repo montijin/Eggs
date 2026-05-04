@@ -1,4 +1,4 @@
-# Eggs — NM Placeholder Tracker for Ashita v4
+# Eggs — Notorious Monster tracker and timer for Ashita v4
 
 **Author:** MNT  
 **Version:** 1.0  
