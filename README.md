@@ -11,10 +11,12 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
 ## Features
 
 - **PH Detection** — Automatically detects when you target a placeholder mob and shows a popup with the NM name, type, and spawn chance
-- **Three UI Windows:**
+- **Four UI Windows:**
   1. **Tracker** — All your tracked NMs with live countdown timers and window status
   2. **PH Detail** — Per-NM placeholder list showing which PHs are dead/alive with respawn timers
   3. **PH Popup** — Auto-appears when targeting any placeholder mob (even untracked NMs)
+  4. **Loot** — Displays the loot table and drop chance of any NM.
+  
 - **NM Browser** — Zone-grouped checklist with search to pick which NMs to track
 - **Three NM Types Supported:**
   - `Timed Lottery` — Spawns off PH death with a % chance; has a cooldown after its own death
@@ -37,12 +39,12 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
 
 ## Setup: Importing NM Data
 
-Eggs reads NM data from the LandSandBird (LSB) server scripts. You need to run this once (and again whenever your LSB scripts are updated).
+Eggs reads NM data from the LandSandBoat (LSB) server scripts. If you want to run this to use a newer version of LSB than the release here is how:
 
 1. Open `Ashita/addons/eggs/import.lua`
 2. Edit the `ZONES_PATH` variable at the top to point to your LSB scripts:
    ```lua
-   local ZONES_PATH = 'C:\\LandSandBird\\server\\scripts\\zones';
+   local ZONES_PATH = 'C:\\LSB\\server\\scripts\\zones';
    ```
 3. In-game, run:
    ```
@@ -60,6 +62,7 @@ Eggs reads NM data from the LandSandBird (LSB) server scripts. You need to run t
 | `/eggs browser` | Open the NM browser to pick which NMs to track |
 | `/eggs settings` | Open the settings window |
 | `/eggs import` | Run the LSB data import |
+| `/eggs loot <NM Name>` | Open the loot window to view of any NM |
 | `/eggs <NM Name>` | Open the PH detail window for a specific NM (case-insensitive) |
 | `/eggs fav <NM Name>` | Add or remove an NM from favorites |
 | `/eggs show` / `/eggs hide` | Show or hide the tracker window |
