@@ -1,45 +1,64 @@
-require('common');
-local chat = require('chat');
 ------------------------------------------------------------
 -- tracker.lua
--- Manages all active timer state.
+-- Manages all active PH and NM timer state.
 --
--- Keys:
---   PH timers:  "ph:<zone_id>:<ph_name>"
---   NM timers:  "nm:<nm_name>"
+-- Timer keys:
+--   PH timers:  "ph:<mob_id>"
+--   NM timers:  "nm:<nm_name_sanitized>"
 --
--- Each entry:
+-- Each timer entry contains:
 --   type         = 'ph' | 'nm'
---   nm_name      = string
---   ph_name      = string (PH only)
---   zone_id      = number
---   respawn_secs = number   (PH: respawn time; NM: window open time)
---   window_secs  = number   (NM: window close time, 0 = unknown)
---   tod_os       = number   (os.time() of death)
---   alarm_fired  = bool
+--   nm_name      = string    NM this timer belongs to
+--   ph_name      = string    PH mob name (PH timers only)
+--   ph_mob_id    = number    PH server mob ID (PH timers only)
+--   zone_id      = number    Zone where the death occurred
+--   respawn_secs = number    PH: respawn time; NM: window open time (seconds)
+--   window_secs  = number    NM: window close time (0 = no known close)
+--   tod_os       = number    os.time() when death was recorded
+--   alarm_fired  = bool      Whether the alarm has already played this cycle
 ------------------------------------------------------------
+
+require('common');
+local chat = require('chat');
 
 local tracker = {};
 
+-- Active timers in memory. Mirrors gSettings.tod_data but as live objects.
 tracker.ActiveTimers = T{};
 
+-- Last seen entity state per entity slot, used for death detection.
+-- [entity_index] = { s=status, id=mob_id, n=name, sp=sp_index, c=poll_count }
+tracker.LastStatus = {};
+
+-- FFXI entity status values we consider "dead".
+-- Status 3 confirmed as dead on LSB private server (e.g. Flying Manta: 1->3 on death).
+local DEAD_STATUSES = { [3] = true };
+
+-- Grace period in seconds after a PH respawn before auto-clearing its timer.
+-- This gives the player time to see the "PH Spawned" status before it disappears.
+local PH_GRACE_SECS = 120;
+
 ------------------------------------------------------------
--- Restore timers from saved settings on load
+-- Initialize
+-- Restores timers from saved settings on addon load.
+-- Drops any timers that already fully expired while offline.
 ------------------------------------------------------------
 tracker.Initialize = function(self)
     self.ActiveTimers = T{};
     if not gSettings.tod_data then return; end
+
     local now     = os.time();
     local expired = {};
+
     for key, saved in pairs(gSettings.tod_data) do
         local elapsed = now - (saved.tod_os or 0);
-        -- Drop PH timers that have already fully expired
-        if saved.type == 'ph' and elapsed >= (saved.respawn_secs or 0) then
-            expired[#expired+1] = key;
-        -- Drop NM timers where the window has fully closed
-        elseif saved.type == 'nm' and (saved.window_secs or 0) > 0
-               and elapsed >= (saved.window_secs or 0) then
-            expired[#expired+1] = key;
+        local is_ph_expired = saved.type == 'ph' and elapsed >= (saved.respawn_secs or 0);
+        local is_nm_expired = saved.type == 'nm'
+            and (saved.window_secs or 0) > 0
+            and elapsed >= (saved.window_secs or 0);
+
+        if is_ph_expired or is_nm_expired then
+            expired[#expired + 1] = key;
         else
             self.ActiveTimers[key] = {
                 type         = saved.type,
@@ -54,34 +73,34 @@ tracker.Initialize = function(self)
             };
         end
     end
-    -- Clean up expired entries from persistent storage
+
+    -- Remove expired entries from persistent storage
     for _, key in ipairs(expired) do
         gSettings.tod_data[key] = nil;
     end
-    if #expired > 0 then
-        gSaveSettings();
-    end
+    if #expired > 0 then gSaveSettings(); end
 end;
 
 ------------------------------------------------------------
--- Record a death and start a timer
+-- RecordDeath
+-- Starts a new timer for a PH or NM death.
+-- tod_os_override: use this timestamp instead of now (for /eggs tod manual entry).
 ------------------------------------------------------------
 tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id, respawn_secs, window_secs, tod_os_override)
+    -- Build the storage key
     local key;
     if dtype == 'ph' then
-        -- Key by mob_id so each individual PH has its own timer
-        local mid = ph_mob_id or 0;
-        key = string.format('ph:%d', mid);
+        key = string.format('ph:%d', ph_mob_id or 0);
     else
-        local safe = nm_name:gsub('[^%w]', '_');
-        key = string.format('nm:%s', safe);
+        key = string.format('nm:%s', nm_name:gsub('[^%w]', '_'));
     end
 
-    -- The server starts the respawn clock when the body despawns, not when HP hits 0.
-    -- We add a fixed offset to compensate for the body despawn delay.
-    -- Only applied to auto-detected deaths, not manual /eggs tod entries.
-    local DESPAWN_OFFSET = gSettings.despawn_offset or 10;
-    local tod = tod_os_override or (os.time() + DESPAWN_OFFSET);
+    -- The server starts the respawn clock when the body despawns, not at HP=0.
+    -- We add a configurable offset to compensate. Manual /eggs tod entries
+    -- bypass this since the player is providing an already-adjusted timestamp.
+    local offset = (tod_os_override == nil) and (gSettings.despawn_offset or 10) or 0;
+    local tod    = tod_os_override or (os.time() + offset);
+
     local entry = {
         type         = dtype,
         nm_name      = nm_name,
@@ -93,37 +112,30 @@ tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id
         tod_os       = tod,
         alarm_fired  = false,
     };
+
     self.ActiveTimers[key] = entry;
 
-    -- When a PH dies, clear its confirmed state so it shows as
-    -- unconfirmed after respawn until the player targets it
+    -- When a PH dies, clear its confirmed-alive state so the UI shows
+    -- it as unconfirmed until the player targets it again after respawn.
     if dtype == 'ph' and ph_mob_id and ph_mob_id > 0 then
         if not gSettings.ph_confirmed then gSettings.ph_confirmed = {}; end
         gSettings.ph_confirmed[ph_mob_id] = nil;
     end
 
-    -- Persist to settings
-    gSettings.tod_data[key] = {
-        type         = dtype,
-        nm_name      = nm_name,
-        ph_name      = ph_name,
-        ph_mob_id    = ph_mob_id,
-        zone_id      = zone_id,
-        respawn_secs = respawn_secs,
-        window_secs  = window_secs or 0,
-        tod_os       = tod,
-        alarm_fired  = false,
-    };
+    -- Persist to disk
+    gSettings.tod_data[key] = entry;
     gSaveSettings();
 
-    local label = dtype == 'ph' and (ph_name or 'PH') or nm_name;
+    -- Print confirmation
+    local label   = dtype == 'ph' and (ph_name or 'PH') or nm_name;
     local tod_str = os.date('%m/%d/%Y %H:%M:%S', tod);
     print(chat.header('Eggs') .. chat.message(
         string.format('[%s] died at %s. Timer started (%ds respawn).', label, tod_str, respawn_secs)));
 end;
 
 ------------------------------------------------------------
--- Remove a timer
+-- RemoveTimer
+-- Removes a timer from both memory and persistent storage.
 ------------------------------------------------------------
 tracker.RemoveTimer = function(self, key)
     self.ActiveTimers[key] = nil;
@@ -132,96 +144,98 @@ tracker.RemoveTimer = function(self, key)
 end;
 
 ------------------------------------------------------------
--- Seconds remaining until respawn (PH) or window opens (NM)
--- Negative means it already passed.
+-- GetRemaining
+-- Returns seconds until a PH respawns (negative if already past).
 ------------------------------------------------------------
 tracker.GetRemaining = function(self, entry)
-    local elapsed = os.time() - entry.tod_os;
-    return entry.respawn_secs - elapsed;
+    return entry.respawn_secs - (os.time() - entry.tod_os);
 end;
 
 ------------------------------------------------------------
--- NM window status
--- Returns: status ('waiting'|'open'|'expired'), secs_until_open, secs_until_close
+-- GetNMWindowStatus
+-- Returns the current state of an NM respawn window.
+--   'waiting' = cooldown not yet elapsed
+--   'open'    = inside the spawn window
+--   'expired' = past the last possible spawn time
+-- Also returns seconds until open and seconds until close.
 ------------------------------------------------------------
 tracker.GetNMWindowStatus = function(self, entry)
-    local elapsed     = os.time() - entry.tod_os;
-    local open_at     = entry.respawn_secs;
-    local close_at    = entry.window_secs;   -- 0 = no known close time
+    local elapsed  = os.time() - entry.tod_os;
+    local open_at  = entry.respawn_secs;
+    local close_at = entry.window_secs;  -- 0 means no known close time
 
     if elapsed < open_at then
+        -- Still in cooldown
         local until_close = (close_at > 0) and (close_at - elapsed) or nil;
         return 'waiting', open_at - elapsed, until_close;
-    elseif close_at > 0 and elapsed >= close_at then
-        return 'expired', 0, 0;
-    else
-        local until_close = (close_at > 0) and (close_at - elapsed) or nil;
-        return 'open', 0, until_close;
     end
+
+    if close_at > 0 and elapsed >= close_at then
+        -- Past all windows
+        return 'expired', 0, 0;
+    end
+
+    -- Window is open
+    local until_close = (close_at > 0) and (close_at - elapsed) or nil;
+    return 'open', 0, until_close;
 end;
 
 ------------------------------------------------------------
--- Poll entity statuses each frame to detect deaths
--- Called from d3d_present via gui:Render()
+-- PollEntities
+-- Called every ~6 frames. Scans the entity list for status
+-- changes and fires CheckAndRecordDeath on death transitions.
 ------------------------------------------------------------
-tracker.LastStatus = {};  -- [entity_index] = last known status
-
--- FFXI entity status values (confirmed on LSB private server):
---   0 = Idle/Alive
---   1 = Engaged in combat
---   3 = Dead (confirmed: Flying Manta transitions 1->3 on death)
-local DEAD_STATUSES = { [3]=true };
-
 tracker.PollEntities = function(self)
     local em      = AshitaCore:GetMemoryManager():GetEntity();
     local zone_id = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local dbg     = gSettings and gSettings.debug_mode;
 
     for idx = 1, 0x7FF do
         local name   = em:GetName(idx);
         local mob_id = em:GetServerId(idx);
 
         if name and name ~= '' and mob_id and mob_id > 0 then
+            -- Entity is present in this slot
             local status   = em:GetStatus(idx);
             local sp_index = mob_id % 1024;
             local last     = self.LastStatus[idx];
 
             if last == nil then
-                -- First time seeing this entity - record with poll count
+                -- First poll for this entity — record initial state
                 self.LastStatus[idx] = { s = status, id = mob_id, n = name, sp = sp_index, c = 1 };
             else
                 last.c = (last.c or 0) + 1;
 
-                -- Debug: print EVERY status change for PH mobs
-                if gSettings.debug_mode and last.s ~= status then
+                -- Debug: log every status change for PH/NM mobs
+                if dbg and last.s ~= status then
                     local is_ph = gNmData:GetNMForPH(sp_index);
                     if is_ph or (gNmData.NMs and gNmData.NMs[name]) then
                         print(chat.header('Eggs') .. chat.message(string.format(
                             'STATUS: idx=%d %s mob_id=%d sp=%d  %d -> %d  (ph=%s)',
-                            idx, name, mob_id, sp_index, last.s, status,
-                            is_ph or 'NM')));
+                            idx, name, mob_id, sp_index, last.s, status, is_ph or 'NM')));
                     end
                 end
 
-                -- Detect transition INTO a dead status
+                -- Fire death detection on the transition into a dead status
                 if DEAD_STATUSES[status] and not DEAD_STATUSES[last.s] then
-                    if gSettings.debug_mode then
+                    if dbg then
                         print(chat.header('Eggs') .. chat.message(string.format(
                             'Death detected: idx=%d name=%s mob_id=%d sp=%d status=%d->%d',
                             idx, name, mob_id, sp_index, last.s, status)));
                     end
                     self:CheckAndRecordDeath(idx, name, mob_id, sp_index, zone_id);
                 end
+
                 last.s  = status;
                 last.id = mob_id;
             end
         else
-            -- Slot empty - entity despawned (or zone transition artifact)
+            -- Slot is empty — entity has despawned or we changed zones
             local last = self.LastStatus[idx];
             if last and last.id and last.id > 0 then
-                local is_debug = gSettings and gSettings.debug_mode;
                 if DEAD_STATUSES[last.s] then
-                    -- Dead body slot cleared - no action needed, timer already running
-                    if is_debug then
+                    -- Body of a dead mob cleared — timer already running, nothing to do
+                    if dbg then
                         local is_ph = gNmData:GetNMForPH(last.sp or 0);
                         if is_ph then
                             print(chat.header('Eggs') .. chat.message(string.format(
@@ -230,8 +244,9 @@ tracker.PollEntities = function(self)
                         end
                     end
                 elseif (last.c or 0) >= 3 then
-                    -- Disappeared without dying (e.g. de-popped NM)
-                    if gSettings.debug_mode then
+                    -- Alive entity disappeared without dying (e.g. de-popped NM or despawn)
+                    -- Must have seen it for at least 3 polls to rule out zone flicker
+                    if dbg then
                         print(chat.header('Eggs') .. chat.message(string.format(
                             'Despawn(no death): idx=%d name=%s mob_id=%d sp=%d polls=%d',
                             idx, last.n or '?', last.id, last.sp or 0, last.c or 0)));
@@ -244,8 +259,13 @@ tracker.PollEntities = function(self)
     end
 end;
 
+------------------------------------------------------------
+-- CheckAndRecordDeath
+-- Determines whether a dying entity is a tracked PH or NM
+-- and starts the appropriate timer.
+------------------------------------------------------------
 tracker.CheckAndRecordDeath = function(self, entity_index, entity_name, mob_id, sp_index, zone_id, from_despawn)
-    local dbg = gSettings and gSettings.debug_mode;
+    local dbg     = gSettings and gSettings.debug_mode;
     local nm_name = gNmData:GetNMForPH(sp_index);
 
     if dbg then
@@ -254,145 +274,131 @@ tracker.CheckAndRecordDeath = function(self, entity_index, entity_name, mob_id, 
             entity_name, sp_index, nm_name or 'none', tostring(from_despawn or false))));
     end
 
+    -- Body-despawn path: update an existing PH timer's start time to now.
+    -- The server starts the respawn clock at body despawn, not at HP=0.
     if from_despawn then
-        -- Body just despawned - update existing timer's tod_os to now
-        -- (server starts respawn clock at body despawn, not at death)
-        if nm_name then
-            local nm_entry = gNmData:GetNM(nm_name) or gNmData:GetNMAnyZone(nm_name);
-            if nm_entry then
-                local safe = nm_name:gsub('[^%w]', '_');
-                local ph_key = string.format('ph:%d', mob_id);
-                if self.ActiveTimers[ph_key] then
-                    self.ActiveTimers[ph_key].tod_os = os.time();
-                    if gSettings.tod_data and gSettings.tod_data[ph_key] then
-                        gSettings.tod_data[ph_key].tod_os = os.time();
-                        gSaveSettings();
-                    end
-                    if dbg then
-                        print(chat.header('Eggs') .. chat.message(
-                            'Body despawned - timer reset to now for ' .. nm_name));
-                    end
-                end
-            end
+        if not nm_name then return; end
+        local ph_key = string.format('ph:%d', mob_id);
+        if not self.ActiveTimers[ph_key] then return; end
+        local now = os.time();
+        self.ActiveTimers[ph_key].tod_os = now;
+        if gSettings.tod_data and gSettings.tod_data[ph_key] then
+            gSettings.tod_data[ph_key].tod_os = now;
+            gSaveSettings();
+        end
+        if dbg then
+            print(chat.header('Eggs') .. chat.message('Body despawned - timer reset to now for ' .. nm_name));
         end
         return;
     end
 
+    -- PH death path: entity is a placeholder for a known NM
     if nm_name then
-        -- Notify popup regardless of tracking
-        local ok, err = pcall(function()
-            gGui:ShowPHPopup(nm_name, entity_name, mob_id);
-        end);
-        if not ok and dbg then
-            print(chat.header('Eggs') .. chat.error('ShowPHPopup error: ' .. tostring(err)));
-        end
+        -- Always show the PH popup (even if not tracking the NM)
+        pcall(function() gGui:ShowPHPopup(nm_name, entity_name, mob_id); end);
 
-        -- Check tracking
         local is_tracked = gSettings.tracked and gSettings.tracked[nm_name];
         if dbg then
             print(chat.header('Eggs') .. chat.message(string.format(
                 'NM=%s tracked=%s', nm_name, tostring(is_tracked ~= nil))));
         end
 
-        if is_tracked then
-            local nm_entry = gNmData:GetNM(nm_name);
-            if dbg then
-                print(chat.header('Eggs') .. chat.message(string.format(
-                    'nm_entry=%s', nm_entry and 'found' or 'NIL - not in current zone!')));
-            end
+        if not is_tracked then return; end
 
-            if not nm_entry then
-                -- Try loading from AllNMs (cross-zone)
-                nm_entry = gNmData:GetNMAnyZone(nm_name);
-                if dbg then
-                    print(chat.header('Eggs') .. chat.message(string.format(
-                        'nm_entry from AllNMs=%s', nm_entry and 'found' or 'still nil')));
-                end
-            end
+        -- Find the NM entry (try current zone first, then cross-zone)
+        local nm_entry = gNmData:GetNM(nm_name) or gNmData:GetNMAnyZone(nm_name);
+        if dbg then
+            print(chat.header('Eggs') .. chat.message(
+                'nm_entry=' .. (nm_entry and 'found' or 'NIL - not in current zone!')));
+        end
+        if not nm_entry then return; end
 
-            if nm_entry then
-                local ph_respawn = 300;
-                if nm_entry.PHs then
-                    for _, ph in ipairs(nm_entry.PHs) do
-                        if ph.Index == sp_index then
-                            local rt = ph.RespawnTime or 0;
-                            ph_respawn = (rt > 0) and rt or 300;
-                            if dbg then
-                                print(chat.header('Eggs') .. chat.message(string.format(
-                                    'PH match: Index=%d RespawnTime=%d',
-                                    ph.Index, ph_respawn)));
-                            end
-                            break;
-                        end
+        -- Find the respawn time for this specific PH
+        local ph_respawn = 300;  -- default 5 minutes if not found in data
+        if nm_entry.PHs then
+            for _, ph in ipairs(nm_entry.PHs) do
+                if ph.Index == sp_index then
+                    local rt = ph.RespawnTime or 0;
+                    ph_respawn = (rt > 0) and rt or 300;
+                    if dbg then
+                        print(chat.header('Eggs') .. chat.message(string.format(
+                            'PH match: Index=%d RespawnTime=%d', ph.Index, ph_respawn)));
                     end
+                    break;
                 end
-                if dbg then
-                    print(chat.header('Eggs') .. chat.message(string.format(
-                        'Calling RecordDeath: ph=%s nm=%s respawn=%d',
-                        entity_name, nm_name, ph_respawn)));
-                end
-                self:RecordDeath('ph', nm_name, entity_name, mob_id, zone_id, ph_respawn, 0);
             end
         end
+
+        if dbg then
+            print(chat.header('Eggs') .. chat.message(string.format(
+                'Calling RecordDeath: ph=%s nm=%s respawn=%d', entity_name, nm_name, ph_respawn)));
+        end
+        self:RecordDeath('ph', nm_name, entity_name, mob_id, zone_id, ph_respawn, 0);
         return;
     end
 
-    -- Is this the NM itself?
-    local nm_entry = gNmData:GetNM(entity_name);
-    if not nm_entry then nm_entry = gNmData:GetNMAnyZone(entity_name); end
+    -- NM death path: entity is the NM itself
+    local nm_entry = gNmData:GetNM(entity_name) or gNmData:GetNMAnyZone(entity_name);
+    if not nm_entry then return; end
+    if not (gSettings.tracked and gSettings.tracked[entity_name]) then return; end
 
-    if nm_entry and gSettings.tracked and gSettings.tracked[entity_name] then
-        -- Clear confirmed-alive state since the NM just died
-        if gGui and gGui.NMConfirmedUp then
-            gGui.NMConfirmedUp[entity_name] = nil;
-        end
-        local window_min, window_max;
-        if nm_entry.NMType == 'timed_spawn' then
-            window_min = nm_entry.WindowMin or 3600;
-            window_max = nm_entry.WindowMax or 0;
-        else
-            window_min = nm_entry.Cooldown or 0;
-            window_max = 0;
-        end
-        if dbg then
-            print(chat.header('Eggs') .. chat.message(string.format(
-                'NM death: %s type=%s window=%d-%d',
-                entity_name, nm_entry.NMType or '?', window_min, window_max)));
-        end
-        -- Only start NM cooldown timer if there's actually a cooldown
-        -- True lottery NMs (like King Arthro) have no cooldown - PHs resume immediately
-        if window_min > 0 or window_max > 0 then
-            self:RecordDeath('nm', entity_name, nil, 0, zone_id, window_min, window_max);
-        else
-            print(chat.header('Eggs') .. chat.message(
-                '[' .. entity_name .. '] died. PHs resume immediately (no cooldown).'));
-        end
-
-        local to_del = {};
-        for key, entry in pairs(self.ActiveTimers) do
-            if entry.nm_name == entity_name and entry.type == 'ph' then
-                to_del[#to_del + 1] = key;
-            end
-        end
-        for _, k in ipairs(to_del) do self:RemoveTimer(k); end
+    -- Clear confirmed-alive state since the NM just died
+    if gGui and gGui.NMConfirmedUp then
+        gGui.NMConfirmedUp[entity_name] = nil;
     end
+
+    -- Determine the respawn window bounds
+    local window_min, window_max;
+    if nm_entry.NMType == 'timed_spawn' then
+        window_min = nm_entry.WindowMin or 3600;
+        window_max = nm_entry.WindowMax or 0;
+    else
+        window_min = nm_entry.Cooldown or 0;
+        window_max = 0;
+    end
+
+    if dbg then
+        print(chat.header('Eggs') .. chat.message(string.format(
+            'NM death: %s type=%s window=%d-%d',
+            entity_name, nm_entry.NMType or '?', window_min, window_max)));
+    end
+
+    if window_min == 0 and window_max == 0 then
+        -- True lottery NM: no cooldown, PHs resume immediately
+        print(chat.header('Eggs') .. chat.message(
+            '[' .. entity_name .. '] died. PHs resume immediately (no cooldown).'));
+    else
+        self:RecordDeath('nm', entity_name, nil, 0, zone_id, window_min, window_max);
+    end
+
+    -- Remove any stale PH timers for this NM now that it has died
+    local to_del = {};
+    for key, entry in pairs(self.ActiveTimers) do
+        if entry.nm_name == entity_name and entry.type == 'ph' then
+            to_del[#to_del + 1] = key;
+        end
+    end
+    for _, k in ipairs(to_del) do self:RemoveTimer(k); end
 end;
 
 ------------------------------------------------------------
--- Alarm tick - called every frame from gui:Render()
+-- Tick
+-- Called every frame from gui:Render().
+-- Fires alarms and cleans up expired PH timers.
 ------------------------------------------------------------
 tracker.Tick = function(self)
-    local warn       = gSettings.alarm_warning_secs or 0;
-    local to_remove  = {};
-    local PH_GRACE   = 120;  -- seconds after respawn before auto-clearing PH timer
+    local warn      = gSettings.alarm_warning_secs or 0;
+    local to_remove = {};
 
     for key, entry in pairs(self.ActiveTimers) do
         if entry.type == 'ph' then
             local rem = self:GetRemaining(entry);
-            -- Auto-remove PH timers well after they've expired (grace period)
-            if rem <= -PH_GRACE then
-                to_remove[#to_remove+1] = key;
+
+            -- Auto-remove PH timers well after expiry (grace period lets UI show "Spawned")
+            if rem <= -PH_GRACE_SECS then
+                to_remove[#to_remove + 1] = key;
             elseif not entry.alarm_fired then
+                -- Fire alarm when countdown reaches the warning threshold
                 if rem <= warn and rem > 0 and gSettings.alarm_on_ph_spawn then
                     gSounds:Play(gSettings.alarm_sound);
                     entry.alarm_fired = true;
@@ -402,19 +408,21 @@ tracker.Tick = function(self)
                     entry.alarm_fired = true;
                 end
             end
+
         elseif entry.type == 'nm' then
             if not entry.alarm_fired then
-                local status, until_open, _ = self:GetNMWindowStatus(entry);
-                if status == 'waiting' then
-                    if warn > 0 and until_open <= warn and until_open > 0 then
-                        if gSettings.alarm_on_window then
-                            gSounds:Play(gSettings.alarm_sound);
-                            entry.alarm_fired = true;
-                            if gSettings.tod_data[key] then gSettings.tod_data[key].alarm_fired = true; end
-                            gSaveSettings();
-                        end
+                local status, until_open = self:GetNMWindowStatus(entry);
+
+                if status == 'waiting' and warn > 0 and until_open <= warn and until_open > 0 then
+                    -- Window is about to open — fire the warning alarm
+                    if gSettings.alarm_on_window then
+                        gSounds:Play(gSettings.alarm_sound);
+                        entry.alarm_fired = true;
+                        if gSettings.tod_data[key] then gSettings.tod_data[key].alarm_fired = true; end
+                        gSaveSettings();
                     end
                 elseif status == 'open' then
+                    -- Window just opened — fire the alarm
                     if gSettings.alarm_on_window then
                         gSounds:Play(gSettings.alarm_sound);
                     end
@@ -426,14 +434,15 @@ tracker.Tick = function(self)
         end
     end
 
-    -- Remove expired PH timers outside the loop to avoid iterator invalidation
+    -- Remove expired PH timers outside the loop to avoid modifying while iterating
     for _, key in ipairs(to_remove) do
         self:RemoveTimer(key);
     end
 end;
 
 ------------------------------------------------------------
--- Format seconds as HH:MM:SS or MM:SS
+-- FormatTime
+-- Formats a duration in seconds as HH:MM:SS or MM:SS.
 ------------------------------------------------------------
 tracker.FormatTime = function(self, secs)
     if not secs or secs <= 0 then return '00:00'; end

@@ -37,12 +37,12 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
 
 ## Setup: Importing NM Data
 
-Eggs reads NM data from the LandSandBoat (LSB) server scripts. You need to run this once if you did not download a data folder. (and again whenever your LSB scripts are updated).
+Eggs reads NM data from the LandSandBird (LSB) server scripts. You need to run this once (and again whenever your LSB scripts are updated).
 
 1. Open `Ashita/addons/eggs/import.lua`
 2. Edit the `ZONES_PATH` variable at the top to point to your LSB scripts:
    ```lua
-   local ZONES_PATH = 'C:\\LSB\\server\\scripts\\zones';
+   local ZONES_PATH = 'C:\\LandSandBird\\server\\scripts\\zones';
    ```
 3. In-game, run:
    ```
@@ -105,7 +105,8 @@ Automatically appears when you target a placeholder mob. Shows the NM name, PH m
 
 Access via `/eggs settings` or the Settings button in the Tracker.
 
-- **Alarm Sound** — Choose from different alarm .wav files
+- **Alarm Sound** — Choose from Chime, Bell, Alert Beep, or Soft Ping (with Test button)
+- **Volume** — Adjust alarm volume
 - **Alarm Triggers** — Toggle alarm on NM window opening and/or PH respawning
 - **Early Warning** — Seconds before the event to trigger the alarm (0 = exact moment)
 - **Display Options** — Show short IDs (last 3 digits only), adjust UI scale
@@ -117,6 +118,9 @@ Access via `/eggs settings` or the Settings button in the Tracker.
 
 ### Lottery NMs (Timed & True)
 - When a **PH dies**, a respawn timer starts (typically 5 minutes)
+- Each time the PH respawns, the server rolls for the NM to spawn based on spawn chance %
+- **Timed Lottery** — after the NM itself dies, a cooldown period must pass before it can pop again
+- **True Lottery** — no cooldown; the NM can pop on the very next PH cycle after dying
 
 ### Timed Spawn NMs
 - No placeholder. After the NM dies, it respawns after a random time within a known window
@@ -156,6 +160,9 @@ Developed with reference to the following open source Ashita addons:
 
 - **[mobdb](https://github.com/ThornyFFXI/mobdb)** by ThornyFFXI — MIT License  
   Referenced for Ashita v4 memory manager API usage (`GetServerId`, `GetSpawnFlags`, `GetStatus`, zone change packet handling)
+
+- **[PlayerNotes](https://github.com/SQLCommit/PlayerNotes)** by SQLCommit — MIT License  
+  Referenced for Ashita sound API usage (`ashita.misc.play_sound`)
 
 ---
 
