@@ -43,6 +43,7 @@ local default_settings = {
     ph_alive_timeout   = 60,     -- seconds after targeting before PH shifts to Unknown
     confirm_untrack    = true,   -- ask for confirmation before removing a tracked NM
     despawn_offset     = 10,     -- seconds added to auto-detected death to account for body despawn delay
+    print_window_time  = false,  -- print real-world window open time when a PH or NM death is recorded
 };
 
 -- Recursively serialize a Lua value to a pretty-printed string.
@@ -78,12 +79,23 @@ local function serialize(val, depth)
 end
 
 -- Write current settings to disk.
+-- tod_data is written last so it's easy to find and copy when sharing ToDs.
 local function save_settings()
     local dir = string.format('%sconfig/addons/%s/', AshitaCore:GetInstallPath(), addon.name);
     ashita.fs.create_directory(dir);
     local f = io.open(SETTINGS_PATH, 'w');
     if not f then return; end
-    f:write('return ' .. serialize(gSettings) .. ';');
+
+    -- Serialize everything except tod_data first
+    local tod_data = gSettings.tod_data;
+    gSettings.tod_data = nil;
+    local main = serialize(gSettings);
+    gSettings.tod_data = tod_data;
+
+    -- Splice tod_data in as the last key before the closing brace
+    local body = main:sub(1, -2); -- strip trailing '}'
+    local tod_str = '    ["tod_data"] = ' .. serialize(tod_data or {}, 1);
+    f:write('return ' .. body .. ',\n' .. tod_str .. '\n};\n');
     f:close();
 end
 
@@ -169,6 +181,7 @@ local function cmd_help()
     print(chat.header('Eggs') .. chat.message('/eggs tod HH:MM:SS <NM Name>             Record NM death at time today'));
     print(chat.header('Eggs') .. chat.message('/eggs tod HH:MM:SS MM/DD/YYYY <NM Name>  Record NM death at specific date and time'));
     print(chat.header('Eggs') .. chat.message('/eggs <NM Name>       Open PH detail (works for any zone)'));
+    print(chat.header('Eggs') .. chat.message('/eggs <NM Name> open  Show real-world clock time for next window'));
 end
 
 local function cmd_show()
@@ -306,15 +319,24 @@ end
 -- /eggs fav <NM Name>
 -- Toggles an NM in/out of the favorites list.
 local function cmd_fav(args)
-    local nm_name = table.concat(args, ' ');
-    if nm_name == '' then return; end
+    local nm_name = table.concat(args, ' ', 2);
+    if nm_name == '' then
+        print(chat.header('Eggs') .. chat.message('Usage: /eggs fav <NM Name>'));
+        return;
+    end
+    if not nm_data.AllNMsLoaded then nm_data:LoadAllForBrowser(); end
+    local nm = nm_data:GetNMAnyZone(nm_name);
+    if not nm then
+        print(chat.header('Eggs') .. chat.error('NM not found: ' .. nm_name));
+        return;
+    end
     if not gSettings.favorites then gSettings.favorites = {}; end
-    if gSettings.favorites[nm_name] then
-        gSettings.favorites[nm_name] = nil;
-        print(chat.header('Eggs') .. chat.message('Removed from favorites: ' .. nm_name));
+    if gSettings.favorites[nm.Name] then
+        gSettings.favorites[nm.Name] = nil;
+        print(chat.header('Eggs') .. chat.message('Removed from favorites: ' .. nm.Name));
     else
-        gSettings.favorites[nm_name] = true;
-        print(chat.header('Eggs') .. chat.message('Added to favorites: ' .. nm_name));
+        gSettings.favorites[nm.Name] = true;
+        print(chat.header('Eggs') .. chat.message('Added to favorites: ' .. nm.Name));
     end
     save_settings();
 end
@@ -400,6 +422,13 @@ local function cmd_tod(args)
         return;
     end
 
+    -- Auto-track the NM if it isn't already — /eggs tod implies the player wants it watched.
+    if not gSettings.tracked then gSettings.tracked = {}; end
+    if not gSettings.tracked[nm.Name] then
+        gSettings.tracked[nm.Name] = { alarm = true };
+        print(chat.header('Eggs') .. chat.message('Now tracking: ' .. nm.Name));
+    end
+
     -- Remove any stale PH timers for this NM before recording the new death
     local to_del = {};
     for key, entry in pairs(gTracker.ActiveTimers) do
@@ -421,6 +450,61 @@ local function cmd_detail(args)
     if not nm_data.AllNMsLoaded then nm_data:LoadAllForBrowser(); end
     gui:SetDetailTarget(nm_name);
     if gSettings.ph_detail_visible then save_settings(); end
+end
+
+-- /eggs <NM Name> open
+-- Prints the real-world clock time when this NM's window opens.
+-- Requires an active timer (ToD must be recorded).
+local function cmd_open(args)
+    -- Strip the trailing 'open' keyword to get the NM name
+    local nm_name = table.concat(args, ' ', 1, #args - 1);
+    if nm_name == '' then
+        print(chat.header('Eggs') .. chat.message('Usage: /eggs <NM Name> open'));
+        return;
+    end
+
+    if not nm_data.AllNMsLoaded then nm_data:LoadAllForBrowser(); end
+    local nm = nm_data:GetNMAnyZone(nm_name);
+    if not nm then
+        print(chat.header('Eggs') .. chat.error('NM not found: ' .. nm_name));
+        return;
+    end
+
+    -- Find the active NM timer
+    local safe      = nm.Name:gsub('[^%w]', '_');
+    local nm_key    = 'nm:' .. safe;
+    local nm_timer  = gTracker.ActiveTimers[nm_key];
+
+    if not nm_timer then
+        print(chat.header('Eggs') .. chat.message(
+            '[' .. nm.Name .. '] No active timer. Record a ToD first with /eggs tod.'));
+        return;
+    end
+
+    local open_at  = nm_timer.tod_os + nm_timer.respawn_secs;
+    local close_at = nm_timer.window_secs > 0 and (nm_timer.tod_os + nm_timer.window_secs) or nil;
+    local today    = os.date('%Y%m%d', os.time());
+    local wcount   = nm and nm.WindowCount or 0;
+
+    local function fmt_clock(t)
+        if os.date('%Y%m%d', t) == today then
+            return os.date('%I:%M:%S %p', t);
+        end
+        return os.date('%a %I:%M:%S %p', t);
+    end
+
+    if wcount > 1 then
+        local close_str = close_at and fmt_clock(close_at) or '?';
+        print(chat.header('Eggs') .. chat.message(string.format(
+            '[%s] Window: %s - %s  (%d windows)',
+            nm.Name, fmt_clock(open_at), close_str, wcount)));
+    elseif close_at then
+        print(chat.header('Eggs') .. chat.message(string.format(
+            '[%s] Opens: %s  Closes: %s', nm.Name, fmt_clock(open_at), fmt_clock(close_at))));
+    else
+        print(chat.header('Eggs') .. chat.message(string.format(
+            '[%s] Eligible at: %s', nm.Name, fmt_clock(open_at))));
+    end
 end
 
 ------------------------------------------------------------
@@ -449,10 +533,15 @@ local function handle_command(args)
     local handler = command_handlers[cmd];
     if handler then
         handler(args);
-    else
-        -- No matching command — treat the whole input as an NM name
-        cmd_detail(args);
+        return;
     end
+    -- Check if the last word is 'open' — e.g. /eggs King Arthro open
+    if args[#args] and args[#args]:lower() == 'open' and #args > 1 then
+        cmd_open(args);
+        return;
+    end
+    -- No matching command — treat the whole input as an NM name
+    cmd_detail(args);
 end
 
 ------------------------------------------------------------

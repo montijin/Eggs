@@ -470,10 +470,9 @@ gui.RenderTrackerWindow = function(self)
     imgui.SameLine();
     imgui.PushStyleColor(ImGuiCol_Button, { 0.30, 0.10, 0.10, 1.0 });
     if imgui.SmallButton(' Clear Monitoring ') then
-        gSettings.tracked     = {};
-        gSettings.tod_data    = {};
-        gTracker.ActiveTimers = T{};
-        gSaveSettings();
+        -- Use the sentinel '__all__' to trigger the shared confirm dialog
+        -- in clear-all mode rather than single-NM removal mode.
+        self.ConfirmUntrack = '__all__';
     end
     imgui.PopStyleColor(1);
     imgui.SameLine();
@@ -496,9 +495,12 @@ gui.RenderTrackerWindow = function(self)
         imgui.TextColored(C.GOLD, 'Timer');   imgui.NextColumn();
         imgui.Separator();
 
-        local to_remove = {};
+        local to_remove  = {};
+        local nm_names   = {};
+        for k in pairs(gSettings.tracked) do nm_names[#nm_names + 1] = k; end
 
-        for nm_name, _ in pairs(gSettings.tracked) do
+        for nm_idx, nm_name in ipairs(nm_names) do
+            local is_last = (nm_idx == #nm_names);
             local nm_entry = gNmData:GetNM(nm_name) or gNmData:GetNMAnyZone(nm_name);
             local nm_type  = nm_entry and nm_entry.NMType or 'unknown';
 
@@ -655,6 +657,17 @@ gui.RenderTrackerWindow = function(self)
                     end
                     imgui.NextColumn();
                 end
+            end
+
+            -- Draw a separator between entries but NOT after the last one,
+            -- which would leave ugly hanging column border stubs below the list.
+            if not is_last then
+                imgui.PushStyleColor(ImGuiCol_Separator, { 0.25, 0.25, 0.30, 1.0 });
+                imgui.Separator(); imgui.NextColumn();
+                imgui.Dummy({ 1, 1 }); imgui.NextColumn();
+                imgui.Dummy({ 1, 1 }); imgui.NextColumn();
+                imgui.Dummy({ 1, 1 }); imgui.NextColumn();
+                imgui.PopStyleColor(1);
             end
         end
 
@@ -1049,7 +1062,7 @@ gui.RenderSettingsWindow = function(self)
     end
     local warn = { gSettings.alarm_warning_secs or 0 };
     imgui.PushItemWidth(200);
-    if imgui.SliderInt('##warn', warn, 0, 600, 'Warn %d sec early') then
+    if imgui.SliderInt('##warn', warn, 0, 30, 'Warn %d sec early') then
         gSettings.alarm_warning_secs = warn[1];
         gSaveSettings();
     end
@@ -1068,6 +1081,11 @@ gui.RenderSettingsWindow = function(self)
     local cu = { gSettings.confirm_untrack ~= false };
     if imgui.Checkbox('Confirm before removing tracked NM', cu) then
         gSettings.confirm_untrack = cu[1];
+        gSaveSettings();
+    end
+    local pwt = { gSettings.print_window_time or false };
+    if imgui.Checkbox('Print window open time on PH/NM death', pwt) then
+        gSettings.print_window_time = pwt[1];
         gSaveSettings();
     end
 
@@ -1222,7 +1240,11 @@ gui.RenderBrowserWindow = function(self)
             #gNmData.AllNMs, tracked_count, fav_count));
         imgui.Separator();
 
+        imgui.Spacing();
+        imgui.PushStyleColor(ImGuiCol_ChildBg, { 0.06, 0.09, 0.06, 1.0 });
+        imgui.PushStyleColor(ImGuiCol_Border,  { 0.14, 0.52, 0.14, 0.85 });
         imgui.BeginChild('##nm_list');
+        imgui.PopStyleColor(2);
 
         -- Tracked section (purple header, above favorites)
         local tracked   = gSettings.tracked or {};
@@ -1257,15 +1279,17 @@ gui.RenderBrowserWindow = function(self)
         if next(favs) ~= nil then
             imgui.PushStyleColor(ImGuiCol_Header,        { 0.20, 0.16, 0.04, 1.0 });
             imgui.PushStyleColor(ImGuiCol_HeaderHovered, { 0.28, 0.22, 0.06, 1.0 });
-            local fav_open = imgui.CollapsingHeader('Favorites##favzone');
+            self._fav_section_open = imgui.CollapsingHeader('Favorites##favzone');
             imgui.PopStyleColor(2);
-            if fav_open then
+            if self._fav_section_open then
                 for _, nm in ipairs(gNmData.AllNMs) do
                     if favs[nm.Name] then
-                        self:RenderBrowserRow(nm, sq, true);
+                        self:RenderBrowserRow(nm, sq, true, 'fav_');
                     end
                 end
             end
+        else
+            self._fav_section_open = false;
         end
 
         -- Zone-grouped NM list
@@ -1292,7 +1316,11 @@ gui.RenderBrowserWindow = function(self)
                 imgui.PopStyleColor(2);
             end
 
-            if self.BrowserZones[cur_zone] then
+            -- Skip NMs already rendered in the open Favorites section to
+            -- prevent two star buttons for the same NM firing simultaneously.
+            local in_open_favs = self._fav_section_open
+                and gSettings.favorites and gSettings.favorites[nm.Name];
+            if self.BrowserZones[cur_zone] and not in_open_favs then
                 self:RenderBrowserRow(nm, sq, false);
             end
 
@@ -1300,8 +1328,6 @@ gui.RenderBrowserWindow = function(self)
         end
 
         imgui.EndChild();
-        imgui.Separator();
-        imgui.TextColored(C.GREEN, string.format('Tracking %d NMs', tracked_count));
     end
 
     imgui.End();
@@ -1318,7 +1344,6 @@ end;
 -- when the same NM appears in multiple sections.
 ------------------------------------------------------------
 gui.RenderBrowserRow = function(self, nm, sq, is_fav_section, id_prefix)
-    local favs = gSettings.favorites or {};
     local pfx  = id_prefix or '';
     imgui.Indent(14);
 
@@ -1345,19 +1370,6 @@ gui.RenderBrowserRow = function(self, nm, sq, is_fav_section, id_prefix)
             gSaveSettings();
         end
     end
-    imgui.SameLine();
-
-    -- Favorites star toggle
-    local is_fav = favs[nm.Name] ~= nil;
-    imgui.PushStyleColor(ImGuiCol_Button,        { 0, 0, 0, 0 });
-    imgui.PushStyleColor(ImGuiCol_ButtonHovered, { 0.3, 0.25, 0.0, 0.5 });
-    local star = is_fav and '[*]' or '[ ]';
-    if imgui.SmallButton(star .. '##fav_' .. pfx .. nm.Name) then
-        if not gSettings.favorites then gSettings.favorites = {}; end
-        gSettings.favorites[nm.Name] = is_fav and nil or true;
-        gSaveSettings();
-    end
-    imgui.PopStyleColor(2);
     imgui.SameLine();
 
     -- NM name (green if tracked, white otherwise)
@@ -1402,23 +1414,37 @@ end;
 gui.RenderConfirmUntrack = function(self)
     if not self.ConfirmUntrack then return; end
 
+    local is_clear_all = (self.ConfirmUntrack == '__all__');
+
     imgui.SetNextWindowSize({ 320, 110 }, ImGuiCond_Appearing);
     local _open = { true };
     if imgui.Begin('Remove Tracking?##confirm', _open) then
-        imgui.Text('Stop tracking ' .. self.ConfirmUntrack .. '?');
-        imgui.TextColored(C.DIM, 'This will clear its saved ToD.');
+        if is_clear_all then
+            imgui.Text('Clear ALL tracked NMs?');
+            imgui.TextColored(C.DIM, 'This will clear all timers and ToD data.');
+        else
+            imgui.Text('Stop tracking ' .. self.ConfirmUntrack .. '?');
+            imgui.TextColored(C.DIM, 'This will clear its saved ToD.');
+        end
         imgui.Spacing();
 
         imgui.PushStyleColor(ImGuiCol_Button, { 0.45, 0.10, 0.10, 1.0 });
         if imgui.Button('Remove', { 120, 0 }) then
-            local nm_name = self.ConfirmUntrack;
-            gSettings.tracked[nm_name] = nil;
-            local del = {};
-            for key, entry in pairs(gTracker.ActiveTimers) do
-                if entry.nm_name == nm_name then del[#del + 1] = key; end
+            if is_clear_all then
+                gSettings.tracked     = {};
+                gSettings.tod_data    = {};
+                gTracker.ActiveTimers = T{};
+                gSaveSettings();
+            else
+                local nm_name = self.ConfirmUntrack;
+                gSettings.tracked[nm_name] = nil;
+                local del = {};
+                for key, entry in pairs(gTracker.ActiveTimers) do
+                    if entry.nm_name == nm_name then del[#del + 1] = key; end
+                end
+                for _, k in ipairs(del) do gTracker:RemoveTimer(k); end
+                gSaveSettings();
             end
-            for _, k in ipairs(del) do gTracker:RemoveTimer(k); end
-            gSaveSettings();
             self.ConfirmUntrack = nil;
         end
         imgui.PopStyleColor(1);

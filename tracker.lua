@@ -131,6 +131,27 @@ tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id
     local tod_str = os.date('%m/%d/%Y %H:%M:%S', tod);
     print(chat.header('Eggs') .. chat.message(
         string.format('[%s] died at %s. Timer started (%ds respawn).', label, tod_str, respawn_secs)));
+
+    -- Optionally print the real-world clock time when the window opens.
+    -- tod already has the despawn offset baked in, so tod + respawn_secs
+    -- gives the correct offset-adjusted eligible time.
+    -- Omits day of week if the window opens today.
+    if gSettings.print_window_time and respawn_secs > 0 then
+        local open_time = tod + respawn_secs;
+        local today     = os.date('%Y%m%d', os.time());
+        local function fmt_clock(t)
+            if os.date('%Y%m%d', t) == today then return os.date('%I:%M:%S %p', t); end
+            return os.date('%a %I:%M:%S %p', t);
+        end
+        if (window_secs or 0) > 0 then
+            local close_time = tod + window_secs;
+            print(chat.header('Eggs') .. chat.message(string.format(
+                '[%s] Eligible: %s - %s', nm_name, fmt_clock(open_time), fmt_clock(close_time))));
+        else
+            print(chat.header('Eggs') .. chat.message(string.format(
+                '[%s] Eligible at: %s', nm_name, fmt_clock(open_time))));
+        end
+    end
 end;
 
 ------------------------------------------------------------
@@ -341,10 +362,11 @@ tracker.CheckAndRecordDeath = function(self, entity_index, entity_name, mob_id, 
     local nm_entry = gNmData:GetNM(entity_name) or gNmData:GetNMAnyZone(entity_name);
     if not nm_entry then return; end
     if not (gSettings.tracked and gSettings.tracked[entity_name]) then return; end
+    local tracked_name = entity_name;
 
     -- Clear confirmed-alive state since the NM just died
     if gGui and gGui.NMConfirmedUp then
-        gGui.NMConfirmedUp[entity_name] = nil;
+        gGui.NMConfirmedUp[tracked_name] = nil;
     end
 
     -- Determine the respawn window bounds
@@ -359,22 +381,22 @@ tracker.CheckAndRecordDeath = function(self, entity_index, entity_name, mob_id, 
 
     if dbg then
         print(chat.header('Eggs') .. chat.message(string.format(
-            'NM death: %s type=%s window=%d-%d',
-            entity_name, nm_entry.NMType or '?', window_min, window_max)));
+            'NM death: %s (tracked as "%s") type=%s window=%d-%d',
+            entity_name, tracked_name, nm_entry.NMType or '?', window_min, window_max)));
     end
 
     if window_min == 0 and window_max == 0 then
         -- True lottery NM: no cooldown, PHs resume immediately
         print(chat.header('Eggs') .. chat.message(
-            '[' .. entity_name .. '] died. PHs resume immediately (no cooldown).'));
+            '[' .. tracked_name .. '] died. PHs resume immediately (no cooldown).'));
     else
-        self:RecordDeath('nm', entity_name, nil, 0, zone_id, window_min, window_max);
+        self:RecordDeath('nm', tracked_name, nil, 0, zone_id, window_min, window_max);
     end
 
     -- Remove any stale PH timers for this NM now that it has died
     local to_del = {};
     for key, entry in pairs(self.ActiveTimers) do
-        if entry.nm_name == entity_name and entry.type == 'ph' then
+        if entry.nm_name == tracked_name and entry.type == 'ph' then
             to_del[#to_del + 1] = key;
         end
     end
