@@ -1088,6 +1088,24 @@ gui.RenderSettingsWindow = function(self)
         gSettings.print_window_time = pwt[1];
         gSaveSettings();
     end
+    local nd = { gSettings.notify_default or false };
+    if imgui.Checkbox('Warn by default', nd) then
+        gSettings.notify_default = nd[1];
+        gSaveSettings();
+    end
+
+    imgui.Spacing();
+
+    -- Default warning time slider (only relevant when notify_default is on)
+    local ndm = { gSettings.notify_default_mins or 60 };
+    imgui.PushItemWidth(200);
+    if imgui.SliderInt('##notifydefaultmins', ndm, 30, 60, 'Default warn: %d min') then
+        gSettings.notify_default_mins = ndm[1];
+        gSaveSettings();
+    end
+    imgui.PopItemWidth();
+    imgui.TextColored(C.DIM,
+        'Time before being eligible to send a chat notification for a default warning.');
 
     -- PH alive timeout: how long after targeting before "Unknown" state kicks in
     local timeout_val = { gSettings.ph_alive_timeout or 60 };

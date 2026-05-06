@@ -70,6 +70,8 @@ tracker.Initialize = function(self)
                 window_secs  = saved.window_secs or 0,
                 tod_os       = saved.tod_os,
                 alarm_fired  = saved.alarm_fired or false,
+                notify_secs  = saved.notify_secs or nil,
+                notify_fired = saved.notify_fired or false,
             };
         end
     end
@@ -101,6 +103,19 @@ tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id
     local offset = (tod_os_override == nil) and (gSettings.despawn_offset or 10) or 0;
     local tod    = tod_os_override or (os.time() + offset);
 
+    -- Preserve any manually-set notify from the previous timer for this NM,
+    -- so a /eggs notify set before /eggs tod isn't silently lost.
+    local prev_notify = nil;
+    if dtype == 'nm' then
+        for _, existing in pairs(self.ActiveTimers) do
+            if existing.type == 'nm' and existing.nm_name == nm_name
+            and existing.notify_secs and not existing.notify_fired then
+                prev_notify = existing.notify_secs;
+                break;
+            end
+        end
+    end
+
     local entry = {
         type         = dtype,
         nm_name      = nm_name,
@@ -111,6 +126,9 @@ tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id
         window_secs  = window_secs or 0,
         tod_os       = tod,
         alarm_fired  = false,
+        notify_secs  = prev_notify or ((dtype == 'nm' and gSettings.notify_default)
+                       and ((gSettings.notify_default_mins or 60) * 60) or nil),
+        notify_fired = false,
     };
 
     self.ActiveTimers[key] = entry;
@@ -432,11 +450,11 @@ tracker.Tick = function(self)
             end
 
         elseif entry.type == 'nm' then
-            if not entry.alarm_fired then
-                local status, until_open = self:GetNMWindowStatus(entry);
+            local status, until_open = self:GetNMWindowStatus(entry);
 
+            -- Alarm: fire sound when window is about to open or just opened
+            if not entry.alarm_fired then
                 if status == 'waiting' and warn > 0 and until_open <= warn and until_open > 0 then
-                    -- Window is about to open — fire the warning alarm
                     if gSettings.alarm_on_window then
                         gSounds:Play(gSettings.alarm_sound);
                         entry.alarm_fired = true;
@@ -444,13 +462,31 @@ tracker.Tick = function(self)
                         gSaveSettings();
                     end
                 elseif status == 'open' then
-                    -- Window just opened — fire the alarm
-                    if gSettings.alarm_on_window then
-                        gSounds:Play(gSettings.alarm_sound);
-                    end
+                    if gSettings.alarm_on_window then gSounds:Play(gSettings.alarm_sound); end
                     entry.alarm_fired = true;
                     if gSettings.tod_data[key] then gSettings.tod_data[key].alarm_fired = true; end
                     gSaveSettings();
+                end
+            end
+
+            -- Notify: independent chat message when countdown drops to notify_secs.
+            -- Reuses status/until_open from the alarm check above — no second call needed.
+            if entry.notify_secs and not entry.notify_fired then
+                if status == 'waiting' and until_open <= entry.notify_secs then
+                    local h = math.floor(until_open / 3600);
+                    local m = math.floor((until_open % 3600) / 60);
+                    local time_label = h > 0 and (m > 0
+                        and string.format('%dhr %dmin', h, m)
+                        or  string.format('%dhr', h))
+                        or  string.format('%dmin', m);
+                    print(chat.header('Eggs') .. chat.message(string.format(
+                        '[%s] Eligible in ~%s.', entry.nm_name, time_label)));
+                    entry.notify_fired = true;
+                    if gSettings.tod_data[key] then gSettings.tod_data[key].notify_fired = true; end
+                    gSaveSettings();
+                elseif status == 'open' or status == 'expired' then
+                    -- Already past — mark fired so we don't check again
+                    entry.notify_fired = true;
                 end
             end
         end

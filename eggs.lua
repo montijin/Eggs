@@ -1,12 +1,12 @@
 ------------------------------------------------------------
 -- Eggs - NM Placeholder Tracker for Ashita v4
--- Author: MNT
+-- Author: Monti
 -- Tracks placeholder mobs, respawn windows, and NM timers.
 ------------------------------------------------------------
 addon.name    = 'Eggs';
-addon.author  = 'MNT';
+addon.author  = 'Monti';
 addon.desc    = 'NM Placeholder tracker and respawn timer';
-addon.version = '1.0';
+addon.version = '1.01';
 
 require('common');
 local chat     = require('chat');
@@ -44,6 +44,8 @@ local default_settings = {
     confirm_untrack    = true,   -- ask for confirmation before removing a tracked NM
     despawn_offset     = 10,     -- seconds added to auto-detected death to account for body despawn delay
     print_window_time  = false,  -- print real-world window open time when a PH or NM death is recorded
+    notify_default     = false,  -- automatically set a chat notify when recording a death
+    notify_default_mins = 60,   -- how many minutes before eligibility to send the chat notify
 };
 
 -- Recursively serialize a Lua value to a pretty-printed string.
@@ -171,21 +173,25 @@ local function cmd_help()
     print(chat.header('Eggs') .. chat.message('/eggs browser         Open NM browser'));
     print(chat.header('Eggs') .. chat.message('/eggs settings        Open settings'));
     print(chat.header('Eggs') .. chat.message('/eggs import          Import NM data from LSB scripts'));
-    print(chat.header('Eggs') .. chat.message('/eggs clear           Clear all timer data'));
+    print(chat.header('Eggs') .. chat.message('/eggs clear <NM Name>  Clears the timer data for a specified NM'));
+    print(chat.header('Eggs') .. chat.message('/eggs clear all        Clears all timer data for tracked NMs'));
     print(chat.header('Eggs') .. chat.message('/eggs debug           Toggle debug mode'));
-    print(chat.header('Eggs') .. chat.message('/eggs deathtime <NM Name>  Show stored ToD for a tracked NM'));
+    print(chat.header('Eggs') .. chat.message('/eggs <NM Name> deathtime  Show stored ToD for a tracked NM'));
     print(chat.header('Eggs') .. chat.message('/eggs track <NM Name>  Start tracking an NM'));
     print(chat.header('Eggs') .. chat.message('/eggs fav <NM Name>   Add/remove NM from favorites'));
     print(chat.header('Eggs') .. chat.message('/eggs loot <NM Name>  Show loot table for an NM'));
-    print(chat.header('Eggs') .. chat.message('/eggs tod <NM Name>                      Record NM death now'));
-    print(chat.header('Eggs') .. chat.message('/eggs tod HH:MM:SS <NM Name>             Record NM death at time today'));
-    print(chat.header('Eggs') .. chat.message('/eggs tod HH:MM:SS MM/DD/YYYY <NM Name>  Record NM death at specific date and time'));
+    print(chat.header('Eggs') .. chat.message('/eggs notify <NM Name> HH:MM or ##HR / ##min  Set chat notify before eligible'));
+    print(chat.header('Eggs') .. chat.message('/eggs tod <NM Name> HH:MM:SS             Record NM death at time today'));
+    print(chat.header('Eggs') .. chat.message('/eggs tod <NM Name> HH:MM:SS MM/DD/YYYY  Record NM death at specific date'));
     print(chat.header('Eggs') .. chat.message('/eggs <NM Name>       Open PH detail (works for any zone)'));
     print(chat.header('Eggs') .. chat.message('/eggs <NM Name> open  Show real-world clock time for next window'));
 end
 
 local function cmd_show()
     gSettings.tracker_visible = true;
+    -- Reset the ImGui open flag so the window isn't immediately closed
+    -- on the next frame after the user dismissed it with the X button.
+    if gGui then gGui._tracker_open[1] = true; end
     save_settings();
 end
 
@@ -210,12 +216,32 @@ local function cmd_import()
     importer:Run();
 end
 
-local function cmd_clear()
-    gSettings.tracked    = {};
-    gSettings.tod_data   = {};
-    gTracker.ActiveTimers = T{};
-    save_settings();
-    print(chat.header('Eggs') .. chat.message('All timers cleared.'));
+local function cmd_clear(args)
+    local target = table.concat(args, ' ', 2):match('^%s*(.-)%s*$');
+    if target == '' then
+        print(chat.header('Eggs') .. chat.message(
+            'Usage: /eggs clear <NM Name>  or  /eggs clear all'));
+        return;
+    end
+    if target:lower() == 'all' then
+        -- Trigger the shared confirm dialog in clear-all mode
+        if gGui then gGui.ConfirmUntrack = '__all__'; end
+    else
+        -- Case-insensitive search through tracked NMs
+        local matched = nil;
+        local target_lower = target:lower();
+        for nm_name in pairs(gSettings.tracked or {}) do
+            if nm_name:lower() == target_lower then
+                matched = nm_name;
+                break;
+            end
+        end
+        if not matched then
+            print(chat.header('Eggs') .. chat.error('Not currently tracking: ' .. target));
+            return;
+        end
+        if gGui then gGui.ConfirmUntrack = matched; end
+    end
 end
 
 local function cmd_debug()
@@ -238,12 +264,13 @@ local function cmd_debug()
         mem_kb, timer_count, track_count, cache_count)));
 end
 
--- /eggs deathtime <NM Name>
+-- /eggs <NM Name> deathtime
 -- Shows the stored time of death for a tracked NM.
+-- Dispatch guarantees "deathtime" is the last word, so strip it with a range concat.
 local function cmd_deathtime(args)
-    local nm_name = table.concat(args, ' ', 2);
+    local nm_name = table.concat(args, ' ', 1, #args - 1);
     if nm_name == '' then
-        print(chat.header('Eggs') .. chat.message('Usage: /eggs deathtime <NM Name>'));
+        print(chat.header('Eggs') .. chat.message('Usage: /eggs <NM Name> deathtime'));
         return;
     end
 
@@ -341,36 +368,103 @@ local function cmd_fav(args)
     save_settings();
 end
 
--- /eggs tod [HH:MM:SS] [MM/DD/YYYY] <NM Name>
--- Records an NM death at a specific time (or now if no time given).
-local function cmd_tod(args)
-    -- Parse optional time and date arguments, then extract the NM name
-    local time_str, date_str, name_start;
+-- /eggs notify <NM Name> HH:MM | #hr | #hr#min | #min
+-- Sets a one-time chat notification before a tracked NM is eligible.
+-- Accepts: 1:30 (HH:MM), 1hr, 1hr30min, 30min (case insensitive)
+local function cmd_notify(args)
+    local time_arg = (args[#args] or ''):lower();
 
-    -- Check arg 2 for a time string (HH:MM:SS or H:MM:SS AM/PM)
-    local a2 = args[2] or '';
-    if a2:match('^%d+:%d+:%d+$') then
-        time_str   = a2;
-        name_start = 3;
-        -- Check arg 3 for AM/PM qualifier
-        local a3 = args[3] or '';
-        if a3:lower() == 'am' or a3:lower() == 'pm' then
-            time_str   = time_str .. ' ' .. a3;
-            name_start = 4;
-        end
-        -- Check next arg for a date string (MM/DD/YYYY)
-        local an = args[name_start] or '';
-        if an:match('^%d+/%d+/%d+$') then
-            date_str   = an;
-            name_start = name_start + 1;
-        end
-    else
-        name_start = 2;
+    -- Try each supported time format in order of specificity.
+    -- Each pattern captures hours and/or minutes and converts to seconds.
+    local function parse_time(s)
+        local hh, mm = s:match('^(%d+):(%d+)$');
+        if hh then return tonumber(hh) * 3600 + tonumber(mm) * 60; end
+        local hr, mn = s:match('^(%d+)hr(%d+)min$');
+        if hr then return tonumber(hr) * 3600 + tonumber(mn) * 60; end
+        local h = s:match('^(%d+)hr$');
+        if h  then return tonumber(h) * 3600; end
+        local m = s:match('^(%d+)min$');
+        if m  then return tonumber(m) * 60; end
+        return nil;
     end
 
-    local nm_name = table.concat(args, ' ', name_start);
+    local notify_secs = parse_time(time_arg);
+    if not notify_secs then
+        print(chat.header('Eggs') .. chat.message(
+            'Usage: /eggs notify <NM Name> HH:MM or ##HR / ##min'));
+        return;
+    end
+
+    -- NM name is args[2..#args-1]
+    local nm_name = table.concat(args, ' ', 2, #args - 1);
     if nm_name == '' then
-        print(chat.header('Eggs') .. chat.message('Usage: /eggs tod [HH:MM:SS [MM/DD/YYYY]] <NM Name>'));
+        print(chat.header('Eggs') .. chat.message(
+            'Usage: /eggs notify <NM Name> HH:MM or ##HR / ##min'));
+        return;
+    end
+
+    -- Find the NM's active timer
+    local nm_lower = nm_name:lower();
+    local found_key, found_entry;
+    for key, entry in pairs(gTracker.ActiveTimers) do
+        if entry.type == 'nm' and entry.nm_name:lower() == nm_lower then
+            found_key   = key;
+            found_entry = entry;
+            break;
+        end
+    end
+
+    if not found_entry then
+        print(chat.header('Eggs') .. chat.error(
+            'No active timer for: ' .. nm_name .. '. Record a ToD first.'));
+        return;
+    end
+
+    found_entry.notify_secs  = notify_secs;
+    found_entry.notify_fired = false;
+    if gSettings.tod_data[found_key] then
+        gSettings.tod_data[found_key].notify_secs  = notify_secs;
+        gSettings.tod_data[found_key].notify_fired = false;
+    end
+    save_settings();
+
+    local h = math.floor(notify_secs / 3600);
+    local m = math.floor((notify_secs % 3600) / 60);
+    local time_label = h > 0 and (m > 0 and string.format('%dhr %dmin', h, m)
+                                           or string.format('%dhr', h))
+                               or string.format('%dmin', m);
+    print(chat.header('Eggs') .. chat.message(string.format(
+        '[%s] Notify set: %s before eligible.', found_entry.nm_name, time_label)));
+end
+-- /eggs tod <NM Name> [HH:MM:SS] [MM/DD/YYYY]
+-- Records an NM death at a specific time (or now if no time given).
+-- NM name comes immediately after "tod"; optional time and date follow the name.
+local function cmd_tod(args)
+    -- Strip the leading "tod" subcommand word, then parse from the end:
+    -- last arg may be MM/DD/YYYY (date), second-to-last may be HH:MM:SS (time).
+    -- Everything before those optional suffixes is the NM name.
+    local time_str, date_str;
+    local name_end = #args; -- inclusive index of last NM name word
+
+    local last = args[name_end] or '';
+    if last:match('^%d+/%d+/%d+$') then
+        date_str = last;
+        name_end = name_end - 1;
+        last = args[name_end] or '';
+    end
+
+    if last:match('^%d+:%d+:%d+$') then
+        time_str = last;
+        name_end = name_end - 1;
+        -- Check for AM/PM qualifier immediately after time (shouldn't happen with new
+        -- syntax but kept for robustness)
+    end
+
+    -- args[2..name_end] is the NM name (args[1] == 'tod')
+    local nm_name = table.concat(args, ' ', 2, name_end);
+    if nm_name == '' then
+        print(chat.header('Eggs') .. chat.message(
+            'Usage: /eggs tod <NM Name> [HH:MM:SS] [MM/DD/YYYY]'));
         return;
     end
 
@@ -519,12 +613,12 @@ local command_handlers = {
     settings  = function(args) cmd_settings(); end,
     browser   = function(args) cmd_browser(); end,
     import    = function(args) cmd_import(); end,
-    clear     = function(args) cmd_clear(); end,
+    clear     = function(args) cmd_clear(args); end,
     debug     = function(args) cmd_debug(); end,
-    deathtime = cmd_deathtime,
     track     = cmd_track,
     loot      = cmd_loot,
     fav       = cmd_fav,
+    notify    = cmd_notify,
     tod       = cmd_tod,
 };
 
@@ -535,10 +629,17 @@ local function handle_command(args)
         handler(args);
         return;
     end
-    -- Check if the last word is 'open' — e.g. /eggs King Arthro open
-    if args[#args] and args[#args]:lower() == 'open' and #args > 1 then
-        cmd_open(args);
-        return;
+    -- Check if the last word is 'open' or 'deathtime' — e.g. /eggs Tiamat open
+    if args[#args] and #args > 1 then
+        local last = args[#args]:lower();
+        if last == 'open' then
+            cmd_open(args);
+            return;
+        end
+        if last == 'deathtime' then
+            cmd_deathtime(args);
+            return;
+        end
     end
     -- No matching command — treat the whole input as an NM name
     cmd_detail(args);
