@@ -184,7 +184,7 @@ local function cmd_help()
     print(chat.header('Eggs') .. chat.message('/eggs tod <NM Name> HH:MM:SS             Record NM death at time today'));
     print(chat.header('Eggs') .. chat.message('/eggs tod <NM Name> HH:MM:SS MM/DD/YYYY  Record NM death at specific date'));
     print(chat.header('Eggs') .. chat.message('/eggs <NM Name>       Open PH detail (works for any zone)'));
-    print(chat.header('Eggs') .. chat.message('/eggs <NM Name> open  Show real-world clock time for next window'));
+    print(chat.header('Eggs') .. chat.message('/eggs open <NM Name>  Gives the time/date for specified NM\'s window'));
 end
 
 local function cmd_show()
@@ -546,14 +546,13 @@ local function cmd_detail(args)
     if gSettings.ph_detail_visible then save_settings(); end
 end
 
--- /eggs <NM Name> open
+-- /eggs open <NM Name>
 -- Prints the real-world clock time when this NM's window opens.
 -- Requires an active timer (ToD must be recorded).
 local function cmd_open(args)
-    -- Strip the trailing 'open' keyword to get the NM name
-    local nm_name = table.concat(args, ' ', 1, #args - 1);
+    local nm_name = table.concat(args, ' ', 2);
     if nm_name == '' then
-        print(chat.header('Eggs') .. chat.message('Usage: /eggs <NM Name> open'));
+        print(chat.header('Eggs') .. chat.message('Usage: /eggs open <NM Name>'));
         return;
     end
 
@@ -619,6 +618,7 @@ local command_handlers = {
     loot      = cmd_loot,
     fav       = cmd_fav,
     notify    = cmd_notify,
+    open      = cmd_open,
     tod       = cmd_tod,
 };
 
@@ -629,17 +629,10 @@ local function handle_command(args)
         handler(args);
         return;
     end
-    -- Check if the last word is 'open' or 'deathtime' — e.g. /eggs Tiamat open
-    if args[#args] and #args > 1 then
-        local last = args[#args]:lower();
-        if last == 'open' then
-            cmd_open(args);
-            return;
-        end
-        if last == 'deathtime' then
-            cmd_deathtime(args);
-            return;
-        end
+    -- Check if the last word is 'deathtime' — e.g. /eggs Tiamat deathtime
+    if args[#args] and #args > 1 and args[#args]:lower() == 'deathtime' then
+        cmd_deathtime(args);
+        return;
     end
     -- No matching command — treat the whole input as an NM name
     cmd_detail(args);

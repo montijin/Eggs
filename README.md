@@ -75,7 +75,7 @@ Eggs reads NM data from the LandSandBoat (LSB) server scripts. If you want to ru
 | `/eggs notify` | Set chat to before in advance before an NM is eligible |
 | `/eggs tod <NM Name> HH:MM:SS` | Record an NM death at the specified time today |
 | `/eggs tod <NM Name> HH:MM:SS MM/DD/YYYY` |  Record an NM death at the specified date and time |
-| `/eggs open <NM Name>` | Tells you the exact date and time a tracked NM will open and close |
+| `/eggs open <NM Name>` | Gives the time/date for specified NM's window |
 
 
 
