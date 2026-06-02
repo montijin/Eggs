@@ -279,8 +279,13 @@ gui.HandleTargetChange = function(self, target_index)
 
     -- Only show NM popup for non-loot NMs that are tracked, have PHs, or are timed spawns.
     -- This prevents every regular mob with a loot_only entry from triggering the popup.
+    -- If the NM has a specific NMMobId (e.g. Bloodsucker shares name with regular mobs),
+    -- verify the targeted mob_id matches before showing the popup.
+    local id_matches = not nm_entry or nm_entry.NMMobId == 0
+        or mob_id == nm_entry.NMMobId;
     local is_relevant = nm_entry
         and nm_entry.NMType ~= 'loot_only'
+        and id_matches
         and (
             (gSettings.tracked and gSettings.tracked[nm_entry.Name]) or
             (nm_entry.PHs and #nm_entry.PHs > 0) or
@@ -464,6 +469,7 @@ gui.RenderTrackerWindow = function(self)
     imgui.SameLine();
     if imgui.SmallButton(' Settings ') then
         gSettings.settings_visible = not gSettings.settings_visible;
+        if gSettings.settings_visible then self._settings_open[1] = true; end
         gSaveSettings();
     end
     imgui.PopStyleColor(1);
@@ -1009,7 +1015,6 @@ gui.RenderSettingsWindow = function(self)
     imgui.SetNextWindowPos(
         { gSettings.settings_pos[1], gSettings.settings_pos[2] }, ImGuiCond_FirstUseEver);
     push_style(0.08, 0.08, 0.08, 0.28, 0.28, 0.35);
-    self._settings_open[1] = true;
 
     if not imgui.Begin('Eggs - Settings##settings', self._settings_open, ImGuiWindowFlags_None) then
         imgui.End();
@@ -1039,11 +1044,13 @@ gui.RenderSettingsWindow = function(self)
     -- Alarm on/off toggle
     imgui.TextColored(C.GOLD, 'Alarm');
     imgui.Separator();
-    local alarm_on = { (gSettings.alarm_volume or 100) > 0 };
-    if imgui.Checkbox('Alarm enabled', alarm_on) then
-        gSettings.alarm_volume = alarm_on[1] and 100 or 0;
+    local vol = { gSettings.alarm_volume or 100 };
+    imgui.PushItemWidth(200);
+    if imgui.SliderInt('##alarmvol', vol, 0, 100, 'Alarm volume: %d%%') then
+        gSettings.alarm_volume = vol[1];
         gSaveSettings();
     end
+    imgui.PopItemWidth();
 
     imgui.Spacing();
 

@@ -380,6 +380,11 @@ tracker.CheckAndRecordDeath = function(self, entity_index, entity_name, mob_id, 
     local nm_entry = gNmData:GetNM(entity_name) or gNmData:GetNMAnyZone(entity_name);
     if not nm_entry then return; end
     if not (gSettings.tracked and gSettings.tracked[entity_name]) then return; end
+
+    -- If the NM data has a specific mob_id (e.g. Bloodsucker NM shares its name with
+    -- regular mobs), verify we have the right one before recording the death.
+    if nm_entry.NMMobId and nm_entry.NMMobId > 0 and mob_id ~= nm_entry.NMMobId then return; end
+
     local tracked_name = entity_name;
 
     -- Clear confirmed-alive state since the NM just died

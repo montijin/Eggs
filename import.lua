@@ -455,6 +455,14 @@ local function resolve_ph_ids(content, mob_ids, nm_key, nm_mob_id, spawn_by_id)
     local ph_block = content:match('entity%.phList%s*=%s*(%b{})');
     if not ph_block then return {}; end
 
+    -- Normalize a key to bare uppercase with underscores for comparison.
+    -- e.g. "Jaggedy-Eared_Jack" -> "JAGGEDY_EARED_JACK"
+    --      "JAGGEDY_EARED_JACK[1]" -> "JAGGEDY_EARED_JACK"
+    local function normalize_key(k)
+        return (k:match('^([%w_%-]+)%[') or k):upper():gsub('-', '_');
+    end
+    local nm_key_norm = normalize_key(nm_key);
+
     -- Pre-build a sorted list of all IDs sharing the NM's RawName in the same zone
     -- Used to resolve LEAPING_LIZZY[2] etc. when mob_ids doesn't have them
     local nm_spawn = nm_mob_id and spawn_by_id[nm_mob_id];
@@ -481,7 +489,9 @@ local function resolve_ph_ids(content, mob_ids, nm_key, nm_mob_id, spawn_by_id)
         local ph_key, ph_offset = parse_ph_expr(ph_expr);
         if ph_key then
             local base_id;
-            if ph_key == nm_key and nm_mob_id then
+            -- Self-referential check: compare normalized keys so that
+            -- e.g. ph_key="JAGGEDY_EARED_JACK" matches nm_key="Jaggedy-Eared_Jack"
+            if normalize_key(ph_key) == nm_key_norm and nm_mob_id then
                 base_id = nm_mob_id;
             else
                 base_id = mob_ids[ph_key];
@@ -523,12 +533,22 @@ import_module.ProcessZone = function(self, zone_id, zone_name, zone_path, mob_id
     local files = list_lua_files(mobs_path);
     if #files == 0 then return {}; end
 
+    -- Files to skip per zone. Used when a mob's Lua filename differs from its
+    -- in-game display name and would create a duplicate or misleading entry.
+    -- e.g. Bloodsucker_NM.lua is the NM but displays in-game as "Bloodsucker";
+    -- it's handled as a manual entry so we skip the auto-detected version.
+    local zone_skip = {
+        [167] = { ['Bloodsucker_NM'] = true },
+    };
+    local skip = zone_skip[zone_id] or {};
+
     local nms         = {};
     local nm_files    = {};
     local ph_spawners = {};
 
     for _, fname in ipairs(files) do
         local raw_key = fname:match('^(.-)%.lua$') or fname;
+        if skip[raw_key] then goto next_file; end
         if nm_files[raw_key] then goto next_file; end
 
         local fpath   = mobs_path .. '\\' .. fname;
@@ -738,14 +758,36 @@ import_module.ProcessZone = function(self, zone_id, zone_name, zone_path, mob_id
 
                 if #phs > 0 and not nms[mob_name] then
                     local nm_spawn = nm_mob_id and self.SpawnById[nm_mob_id];
+
+                    -- Look up the real chance and cooldown from the PH file's phOnDespawn.
+                    -- The phList path defaults to true_lottery/100%/0cd, but many of these
+                    -- NMs actually have a timed cooldown set in the PH's despawn handler.
+                    local nm_chance   = 100;
+                    local nm_cooldown = 0;
+                    local nm_fname_norm = fname:upper():gsub('[%-%s]', '_');
+                    for _, ph in ipairs(ph_spawners) do
+                        local ph_nm_norm = (ph.nm_bare_key or ''):upper():gsub('[%-%s]', '_');
+                        if ph_nm_norm == nm_fname_norm then
+                            nm_chance   = ph.chance   or nm_chance;
+                            nm_cooldown = ph.cooldown or nm_cooldown;
+                            break;
+                        end
+                    end
+
+                    local nm_type = nm_cooldown > 0 and 'timed_lottery' or 'true_lottery';
+                    for _, p in ipairs(phs) do
+                        p.Chance     = nm_chance;
+                        p.NMCooldown = nm_cooldown;
+                    end
+
                     nms[mob_name] = {
                         Name           = mob_name,
                         ZoneId         = zone_id,
-                        NMType         = 'true_lottery',
+                        NMType         = nm_type,
                         NMMobId        = nm_mob_id or 0,
                         NMIndex        = nm_spawn and nm_spawn.Index or 0,
-                        Chance         = 100,
-                        Cooldown       = 0,
+                        Chance         = nm_chance,
+                        Cooldown       = nm_cooldown,
                         WindowMin      = 0,
                         WindowMax      = 0,
                         WindowInterval = 0,
@@ -917,6 +959,135 @@ end;
 ------------------------------------------------------------
 import_module.GetManualEntries = function(self, zone_id)
     local entries = {
+        -- Zone 3: Manaclipper
+        -- Zoredonite is a timed spawn on the boat with a 12hr respawn.
+        -- No PH — spawns directly after cooldown expires.
+        [3] = {
+            ['Zoredonite'] = {
+                Name           = 'Zoredonite',
+                ZoneId         = 3,
+                NMType         = 'timed_spawn',
+                NMMobId        = 16789518,
+                NMIndex        = 16789518 % 1024,
+                Chance         = 0,
+                Cooldown       = 0,
+                WindowMin      = 43200,
+                WindowMax      = 0,
+                WindowInterval = 0,
+                WindowCount    = 0,
+                Loot           = self:BuildLootTable(zone_id, 'zoredonite'),
+                PHs            = {},
+            },
+        },
+        -- Zone 102: La Theine Plateau
+        -- Lumbering Lambert and Bloodtear Baldurf have a multi-step PH chain:
+        -- Battering Ram -> Lumbering Lambert -> Bloodtear Baldurf
+        -- The self-referential phLists and chained cooldowns can't be auto-detected.
+        [102] = {
+            ['Lumbering Lambert'] = {
+                Name           = 'Lumbering Lambert',
+                ZoneId         = 102,
+                NMType         = 'timed_lottery',
+                NMMobId        = 17195317,
+                NMIndex        = 309,
+                Chance         = 10,
+                Cooldown       = 1200,
+                WindowMin      = 0,
+                WindowMax      = 0,
+                WindowInterval = 0,
+                WindowCount    = 0,
+                Loot           = self:BuildLootTable(zone_id, 'lumbering lambert'),
+                PHs            = {
+                    { Id = 17195143, Index = 135, Name = 'Battering Ram', Chance = 10, NMCooldown = 1200, RespawnTime = 1200 },
+                    { Id = 17195316, Index = 308, Name = 'Battering Ram', Chance = 10, NMCooldown = 1200, RespawnTime = 1200 },
+                },
+            },
+            ['Bloodtear Baldurf'] = {
+                Name           = 'Bloodtear Baldurf',
+                ZoneId         = 102,
+                NMType         = 'timed_lottery',
+                NMMobId        = 17195318,
+                NMIndex        = 310,
+                Chance         = 10,
+                Cooldown       = 75600,
+                WindowMin      = 0,
+                WindowMax      = 0,
+                WindowInterval = 0,
+                WindowCount    = 0,
+                Loot           = self:BuildLootTable(zone_id, 'bloodtear baldurf'),
+                -- Bloodtear shares PHs with Lumbering Lambert (same Battering Rams),
+                -- plus Lumbering Lambert itself can also spawn Bloodtear.
+                PHs            = {
+                    { Id = 17195143, Index = 135, Name = 'Battering Ram', Chance = 10, NMCooldown = 75600, RespawnTime = 1200 },
+                    { Id = 17195316, Index = 308, Name = 'Battering Ram', Chance = 10, NMCooldown = 75600, RespawnTime = 1200 },
+                    { Id = 17195317, Index = 309, Name = 'Lumbering Lambert', Chance = 10, NMCooldown = 75600, RespawnTime = 1200 },
+                },
+            },
+        },
+        -- Zone 108: Konschtat Highlands
+        -- Same three-tier chain as La Theine:
+        -- Tremor Ram -> Rampaging Ram -> Steelfleece Baldarich
+        [108] = {
+            ['Rampaging Ram'] = {
+                Name           = 'Rampaging Ram',
+                ZoneId         = 108,
+                NMType         = 'timed_lottery',
+                NMMobId        = 17219886,
+                NMIndex        = 302,
+                Chance         = 10,
+                Cooldown       = 1200,
+                WindowMin      = 0,
+                WindowMax      = 0,
+                WindowInterval = 0,
+                WindowCount    = 0,
+                Loot           = self:BuildLootTable(zone_id, 'rampaging ram'),
+                PHs            = {
+                    { Id = 17219885, Index = 301, Name = 'Tremor Ram', Chance = 10, NMCooldown = 1200, RespawnTime = 1200 },
+                    { Id = 17219987, Index = 403, Name = 'Tremor Ram', Chance = 10, NMCooldown = 1200, RespawnTime = 1200 },
+                },
+            },
+            ['Steelfleece Baldarich'] = {
+                Name           = 'Steelfleece Baldarich',
+                ZoneId         = 108,
+                NMType         = 'timed_lottery',
+                NMMobId        = 17219887,
+                NMIndex        = 303,
+                Chance         = 10,
+                Cooldown       = 75600,
+                WindowMin      = 0,
+                WindowMax      = 0,
+                WindowInterval = 0,
+                WindowCount    = 0,
+                Loot           = self:BuildLootTable(zone_id, 'steelfleece baldarich'),
+                -- Steelfleece shares PHs with Rampaging Ram (same Tremor Rams),
+                -- plus Rampaging Ram itself can also spawn Steelfleece.
+                PHs            = {
+                    { Id = 17219885, Index = 301, Name = 'Tremor Ram', Chance = 10, NMCooldown = 75600, RespawnTime = 1200 },
+                    { Id = 17219987, Index = 403, Name = 'Tremor Ram', Chance = 10, NMCooldown = 75600, RespawnTime = 1200 },
+                    { Id = 17219886, Index = 302, Name = 'Rampaging Ram', Chance = 10, NMCooldown = 75600, RespawnTime = 1200 },
+                },
+            },
+        },
+        -- Zone 167: Bostaunieux Oubliette
+        -- "Bloodsucker NM" shares its display name with regular Bloodsucker mobs in the zone.
+        -- The NM is always mob_id 17461478 — the only reliable way to distinguish it.
+        [167] = {
+            ['Bloodsucker'] = {
+                Name           = 'Bloodsucker',
+                ZoneId         = 167,
+                NMType         = 'timed_spawn',
+                NMMobId        = 17461478,
+                NMIndex        = 17461478 % 1024,
+                Chance         = 0,
+                Cooldown       = 0,
+                WindowMin      = 3600,
+                WindowMax      = 0,
+                WindowInterval = 0,
+                WindowCount    = 0,
+                Loot           = self:BuildLootTable(zone_id, 'bloodsucker'),
+                PHs            = {},
+            },
+        },
         -- Zone 30: Riverne - Site #A01
         [30] = {
             ['Carmine Dobsonfly'] = {
@@ -1021,6 +1192,40 @@ import_module.Run = function(self)
                     if manual then
                         for nm_name, entry in pairs(manual) do
                             if not result[nm_name] then
+                                -- Resolve PHs from the NM's Lua file phList if present
+                                if #entry.PHs == 0 then
+                                    local nm_raw  = nm_name:gsub(' ', '_');
+                                    local nm_path = zone_path .. '\\mobs\\' .. nm_raw .. '.lua';
+                                    local nm_content = read_file(nm_path);
+                                if nm_content then
+                                        -- Resolve NM mob ID from SQL data if not hardcoded
+                                        local nm_mob_id = (entry.NMMobId and entry.NMMobId > 0)
+                                            and entry.NMMobId or nil;
+                                        if not nm_mob_id then
+                                            local zone_spawns = self.SpawnByZone[zone_id];
+                                            local nm_lower    = nm_name:lower();
+                                            for mid, sp in pairs(zone_spawns or {}) do
+                                                if sp.Name:lower() == nm_lower then
+                                                    if not nm_mob_id or mid < nm_mob_id then
+                                                        nm_mob_id = mid;
+                                                    end
+                                                end
+                                            end
+                                        end
+                                        local nm_spawn    = nm_mob_id and self.SpawnById[nm_mob_id];
+                                        entry.NMMobId     = nm_mob_id or 0;
+                                        entry.NMIndex     = nm_spawn and nm_spawn.Index or 0;
+
+                                        local phs = resolve_ph_ids(
+                                            nm_content, mob_ids, nm_raw, nm_mob_id, self.SpawnById);
+                                        for _, p in ipairs(phs) do
+                                            p.Chance      = entry.Chance;
+                                            p.NMCooldown  = entry.Cooldown;
+                                            p.RespawnTime = self:GetRespawnTime(p.Id, zone_id);
+                                        end
+                                        entry.PHs = phs;
+                                    end
+                                end
                                 result[nm_name] = entry;
                             end
                         end

@@ -202,6 +202,9 @@ end
 
 local function cmd_settings()
     gSettings.settings_visible = not gSettings.settings_visible;
+    if gSettings.settings_visible and gGui then
+        gGui._settings_open[1] = true;
+    end
     save_settings();
 end
 
@@ -653,8 +656,9 @@ ashita.events.register('load', 'eggs_load', function()
         string.format('v%s loaded. /eggs help for commands.', addon.version)));
 end);
 
--- On unload: persist settings to disk.
+-- On unload: release DirectSound buffers and persist settings.
 ashita.events.register('unload', 'eggs_unload', function()
+    if gSounds then gSounds:Cleanup(); end
     save_settings();
 end);
 
