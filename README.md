@@ -6,7 +6,7 @@
 
 An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timers in Final Fantasy XI. Eggs monitors placeholder mob deaths, tracks respawn countdowns, and alerts you when an NM window opens or a PH is due to respawn.
 
-![Eggs tracker and placeholder detail windows](images/Eggs-UI.webp)
+![Eggs tracker and placeholder detail windows](images/eggs-ui-v1.03.webp)
 
 ---
 
