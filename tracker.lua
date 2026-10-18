@@ -20,11 +20,58 @@
 
 require('common');
 local chat = require('chat');
+local wave = require('wave');
 
 local tracker = {};
 
+-- Respawn wave learning (see wave.lua). Exposed so the GUI/commands can use it.
+tracker.Wave = wave;
+
+tracker.WaveZone  = 0;
+
+local WAVE_NEAR_YALMS  = 30;    -- a spawn must appear within this of the player
+local WAVE_DESPAWN_FADE = 3;    -- server removes the body 3s after despawn starts
+
+-- Diagnostics for /eggs wave debug: counters, a short event log, and poll info.
+tracker.WaveStats  = {};
+tracker.WaveLog    = {};
+tracker.PollCount  = 0;
+tracker.LastPollHr = 0;
+
+local function wcount(key)
+    tracker.WaveStats[key] = (tracker.WaveStats[key] or 0) + 1;
+end
+
+-- Count an event and keep a line of it in the log. Also prints live when
+-- gSettings.wave_debug is on (/eggs wave debug on).
+local function wnote(key, msg)
+    wcount(key);
+    tracker.WaveLog[#tracker.WaveLog + 1] = os.date('%H:%M:%S') .. '  ' .. msg;
+    if #tracker.WaveLog > 40 then table.remove(tracker.WaveLog, 1); end
+    if gSettings and gSettings.wave_debug then
+        print(chat.header('Eggs') .. chat.message('[wave] ' .. msg));
+    end
+end
+
 -- Active timers in memory. Mirrors gSettings.tod_data but as live objects.
 tracker.ActiveTimers = T{};
+
+-- Generic mob respawn timers for the "ID Respawn Tracking" window.
+-- Keyed by tostring(mob_id). Mirrors gSettings.id_tracked.
+-- Plain table (not T{}) so membership tests on unknown keys are false.
+-- Entry fields:
+--   mob_id, sp_index, name, zone_id
+--   respawn_secs  = seconds from death to respawn
+--   is_estimate   = true when respawn_secs is the configured default (no data)
+--   state         = 'alive' | 'dead'
+--   tod_os        = os.time() of death (nil while alive)
+--   alarm_fired   = early-warning alarm already played this cycle
+--   due_notified  = "window is up" chat line already printed this cycle
+tracker.IdTargets = {};
+
+-- Populated each poll: [sp_index] = entity status for mobs present right now.
+tracker.PresentIndex = {};
+tracker.CurrentZone  = 0;
 
 -- Last seen entity state per entity slot, used for death detection.
 -- [entity_index] = { s=status, id=mob_id, n=name, sp=sp_index, c=poll_count }
@@ -33,6 +80,13 @@ tracker.LastStatus = {};
 -- FFXI entity status values we consider "dead".
 -- Status 3 confirmed as dead on LSB private server (e.g. Flying Manta: 1->3 on death).
 local DEAD_STATUSES = { [3] = true };
+
+-- Real wall-clock now with sub-second precision, or nil until the wave module
+-- has calibrated Ashita's clock against os.time().
+local function wall_now()
+    local off = wave.WallOffset();
+    return off and (wave.Now() + off) or nil;
+end
 
 -- Grace period in seconds after a PH respawn before auto-clearing its timer.
 -- This gives the player time to see the "PH Spawned" status before it disappears.
@@ -45,6 +99,42 @@ local PH_GRACE_SECS = 120;
 ------------------------------------------------------------
 tracker.Initialize = function(self)
     self.ActiveTimers = T{};
+
+    -- Restore generic ID respawn timers. If a mob was dead and its respawn
+    -- already elapsed while offline, assume it is back up.
+    self.IdTargets = {};
+    if gSettings.id_tracked then
+        local now = os.time();
+        for key, s in pairs(gSettings.id_tracked) do
+            local e = {
+                mob_id       = s.mob_id,
+                sp_index     = s.sp_index or ((s.mob_id or 0) % 1024),
+                name         = s.name or '?',
+                zone_id      = s.zone_id or 0,
+                respawn_secs = s.respawn_secs or 300,
+                scripted     = s.scripted or false,
+                manual       = s.manual or false,
+                is_estimate  = s.is_estimate or false,
+                state        = s.state or 'alive',
+                tod_os       = s.tod_os,
+                tod_wall     = s.tod_wall,
+                tod_exact    = s.tod_exact or false,
+                alarm_fired  = s.alarm_fired or false,
+                due_notified = s.due_notified or false,
+                note         = s.note or '',
+            };
+            if e.state == 'dead' and e.tod_os
+               and (now - e.tod_os) >= e.respawn_secs then
+                e.state = 'alive';
+                e.tod_os = nil;
+                e.tod_wall = nil;
+                e.alarm_fired = false;
+                e.due_notified = false;
+            end
+            self.IdTargets[key] = e;
+        end
+    end
+
     if not gSettings.tod_data then return; end
 
     local now     = os.time();
@@ -69,6 +159,8 @@ tracker.Initialize = function(self)
                 respawn_secs = saved.respawn_secs,
                 window_secs  = saved.window_secs or 0,
                 tod_os       = saved.tod_os,
+                tod_wall     = saved.tod_wall,
+                on_wave      = saved.on_wave,
                 alarm_fired  = saved.alarm_fired or false,
                 notify_secs  = saved.notify_secs or nil,
                 notify_fired = saved.notify_fired or false,
@@ -103,6 +195,11 @@ tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id
     local offset = (tod_os_override == nil) and (gSettings.despawn_offset or 10) or 0;
     local tod    = tod_os_override or (os.time() + offset);
 
+    -- Sub-second version of the same moment, so wave timing is not rounded to
+    -- whole seconds. Only for live deaths; a typed-in ToD has no such precision.
+    local now_wall = (tod_os_override == nil) and wall_now() or nil;
+    local tod_wall = now_wall and (now_wall + offset) or nil;
+
     -- Preserve any manually-set notify from the previous timer for this NM,
     -- so a /eggs notify set before /eggs tod isn't silently lost.
     local prev_notify = nil;
@@ -125,6 +222,7 @@ tracker.RecordDeath = function(self, dtype, nm_name, ph_name, ph_mob_id, zone_id
         respawn_secs = respawn_secs,
         window_secs  = window_secs or 0,
         tod_os       = tod,
+        tod_wall     = tod_wall,
         alarm_fired  = false,
         notify_secs  = prev_notify or ((dtype == 'nm' and gSettings.notify_default)
                        and ((gSettings.notify_default_mins or 60) * 60) or nil),
@@ -183,11 +281,281 @@ tracker.RemoveTimer = function(self, key)
 end;
 
 ------------------------------------------------------------
+-- Respawn timers and the wave
+-- The server does not spawn a mob the moment its timer ends: a wave tick
+-- every 30s spawns whatever is due within the next 15s (see wave.lua). So the
+-- real repop is the first tick at or after  despawn + respawn - 15s.
+--
+-- Every timer in the addon goes through RepopRemaining:
+--   wave known ('locked' / 'saved')  -> seconds until that tick
+--   wave unknown ('plain')           -> the plain timer, which already
+--                                       includes the despawn_offset setting
+------------------------------------------------------------
+
+-- Seconds until a mob despawned at `despawn_os` (os.time scale, offset
+-- already applied) with `respawn_secs` should be back; negative once due.
+-- `despawn_wall` is a sub-second version of the same moment when we have one.
+-- Returns remaining, kind ('locked' | 'saved' | 'plain').
+tracker.RepopRemaining = function(self, zone_id, despawn_os, respawn_secs, despawn_wall)
+    local plain = respawn_secs - (os.time() - despawn_os);
+
+    if gSettings.wave_enabled == false or not zone_id or zone_id == 0 then
+        return plain, 'plain';
+    end
+
+    local now_wall = wall_now();
+    if not now_wall then return plain, 'plain'; end
+
+    local at, kind = wave:RepopWall(zone_id, despawn_wall or despawn_os, respawn_secs);
+    if not at then return plain, 'plain'; end
+    return at - now_wall, kind;
+end;
+
+-- A generic ID-tracked mob. Scripted respawns (launch module extras) do not
+-- use the wave.
+tracker.IdRemaining = function(self, e)
+    if e.scripted then
+        return e.respawn_secs - (os.time() - e.tod_os), 'plain';
+    end
+    return self:RepopRemaining(e.zone_id, e.tod_os, e.respawn_secs, e.tod_wall);
+end;
+
+------------------------------------------------------------
 -- GetRemaining
--- Returns seconds until a PH respawns (negative if already past).
+-- Returns seconds until a PH respawns (negative if already past), and
+-- whether that came from the wave ('locked'/'saved') or the plain timer.
 ------------------------------------------------------------
 tracker.GetRemaining = function(self, entry)
-    return entry.respawn_secs - (os.time() - entry.tod_os);
+    return self:RepopRemaining(entry.zone_id, entry.tod_os, entry.respawn_secs, entry.tod_wall);
+end;
+
+------------------------------------------------------------
+-- ID Respawn Tracking helpers
+------------------------------------------------------------
+
+-- Mirror one IdTargets entry to persistent storage (nil key => delete).
+tracker.SaveIdTarget = function(self, key)
+    if not gSettings.id_tracked then gSettings.id_tracked = {}; end
+    local e = self.IdTargets[key];
+    if not e then
+        gSettings.id_tracked[key] = nil;
+    else
+        gSettings.id_tracked[key] = {
+            mob_id       = e.mob_id,
+            sp_index     = e.sp_index,
+            name         = e.name,
+            zone_id      = e.zone_id,
+            respawn_secs = e.respawn_secs,
+            scripted     = e.scripted,
+            manual       = e.manual,
+            is_estimate  = e.is_estimate,
+            state        = e.state,
+            tod_os       = e.tod_os,
+            tod_wall     = e.tod_wall,
+            tod_exact    = e.tod_exact,
+            alarm_fired  = e.alarm_fired,
+            due_notified = e.due_notified,
+            note         = e.note,
+        };
+    end
+    gSaveSettings();
+end;
+
+-- Start tracking a generic mob. Returns false if already tracked.
+tracker.AddIdTarget = function(self, mob_id, sp_index, name, zone_id, respawn_secs, is_estimate, note, scripted, manual)
+    local key = tostring(mob_id);
+    if self.IdTargets[key] then return false; end
+    self.IdTargets[key] = {
+        mob_id       = mob_id,
+        sp_index     = sp_index,
+        name         = name,
+        zone_id      = zone_id,
+        respawn_secs = respawn_secs,
+        scripted     = scripted and true or false,   -- respawned by script, not by the wave
+        manual       = manual and true or false,     -- respawn set by the player with /e <secs>; never auto-corrected
+        is_estimate  = is_estimate and true or false,
+        state        = 'alive',
+        tod_os       = nil,
+        alarm_fired  = false,
+        due_notified = false,
+        note         = note or '',
+    };
+    self:SaveIdTarget(key);
+    return true;
+end;
+
+tracker.RemoveIdTarget = function(self, key)
+    self.IdTargets[key] = nil;
+    if gSettings.id_tracked then gSettings.id_tracked[key] = nil; end
+    gSaveSettings();
+end;
+
+-- Set (or clear, with '') the free-text note on a tracked mob.
+-- Returns true if the mob was tracked.
+tracker.SetIdNote = function(self, mob_id, note)
+    local key = tostring(mob_id);
+    local e   = self.IdTargets[key];
+    if not e then return false; end
+    e.note = note or '';
+    self:SaveIdTarget(key);
+    return true;
+end;
+
+-- Re-read a tracked mob's respawn from the server data, so an entry saved
+-- earlier (from the import, or before a module changed it) is
+-- corrected. Manual /e <secs> values are never touched.
+tracker.RefreshIdRespawn = function(self, key)
+    local e = self.IdTargets[key];
+    if not e or e.manual then return false; end
+
+    local r, _, scripted = gYamlRespawn.Resolve(e.zone_id, e.mob_id);
+    if r == nil then return false; end
+
+    scripted = scripted and true or false;
+    if r == e.respawn_secs and scripted == (e.scripted and true or false) and not e.is_estimate then
+        return false;
+    end
+
+    if r ~= e.respawn_secs then
+        print(chat.header('Eggs') .. chat.message(string.format(
+            '[%s] respawn corrected %s -> %s (server data).',
+            e.name, self:FormatTime(e.respawn_secs), self:FormatTime(r))));
+    end
+    e.respawn_secs = r;
+    e.scripted     = scripted;
+    e.is_estimate  = false;
+    self:SaveIdTarget(key);
+    return true;
+end;
+
+-- Record the death of a generic ID-tracked mob (starts its respawn clock).
+-- Called from CheckAndRecordDeath; returns true if the mob was tracked.
+tracker.RecordIdDeath = function(self, mob_id)
+    local key = tostring(mob_id);
+    local e   = self.IdTargets[key];
+    if not e then return false; end
+    if e.state == 'dead' then return true; end
+
+    self:RefreshIdRespawn(key);   -- use the current server data for this cycle
+
+    -- The server starts the respawn clock when the body despawns, not at
+    -- HP=0. Push the recorded ToD forward by the same configurable offset
+    -- used for NM/PH timers so the countdown lines up with the server.
+    local offset = gSettings.despawn_offset or 10;
+
+    -- Scripted respawns (launch module extras) come back a fixed time after
+    -- death, not after the despawn, so their clock starts at the death itself.
+    if e.scripted then offset = 0; end
+
+    local now_wall = wall_now();
+
+    e.state        = 'dead';
+    e.tod_os       = os.time() + offset;
+    e.tod_wall     = now_wall and (now_wall + offset) or nil;   -- sub-second copy for wave timing
+    e.tod_exact    = e.scripted and true or false;  -- becomes true once we see the body despawn
+    e.alarm_fired  = false;
+    e.due_notified = false;
+    self:SaveIdTarget(key);
+
+    print(chat.header('Eggs') .. chat.message(string.format(
+        '[%s] died. Respawn in %s%s.',
+        e.name, self:FormatTime(e.respawn_secs),
+        e.is_estimate and ' (est)' or '')));
+    return true;
+end;
+
+------------------------------------------------------------
+-- Respawn wave learning
+-- The wave grid is a property of the zone, so any mob we see spawn in front
+-- of us gives its phase. Nothing about how or where the mob died matters.
+------------------------------------------------------------
+local function dist2d(ax, az, bx, bz)
+    local dx, dz = ax - bx, az - bz;
+    return math.sqrt(dx * dx + dz * dz);
+end
+
+-- The dead body of a mob just vanished from the entity list. This has
+-- nothing to do with learning the wave; it only sharpens the death time of
+-- ID-tracked mobs. The server starts the respawn clock when the despawn
+-- begins, which is 3s before the body disappears. That is far more exact
+-- than a fixed offset from the moment HP hit 0.
+tracker.WaveOnBodyCleared = function(self, mob_id, hr)
+    local off       = wave.WallOffset();
+    local now_os    = os.time();
+    local start_os  = math.floor(now_os - WAVE_DESPAWN_FADE);
+    local start_wal = off and (hr + off - WAVE_DESPAWN_FADE) or nil;
+    local fixed     = false;
+
+    -- A generic ID-tracked mob.
+    local key = tostring(mob_id);
+    local e   = self.IdTargets[key];
+    if e and e.state == 'dead' and not e.scripted then
+        e.tod_os    = start_os;
+        e.tod_wall  = start_wal;
+        e.tod_exact = true;
+        self:SaveIdTarget(key);
+        fixed = true;
+    end
+
+    -- A placeholder timer started by this same death (a few seconds ago).
+    local pk = string.format('ph:%d', mob_id);
+    local p  = self.ActiveTimers[pk];
+    if p and p.type == 'ph' and p.tod_os and (now_os - p.tod_os) < 60 then
+        p.tod_os    = start_os;
+        p.tod_wall  = start_wal;
+        p.tod_exact = true;
+        gSaveSettings();
+        fixed = true;
+    end
+
+    if fixed then
+        wnote('cleared', string.format('body of %d cleared, respawn clock started 3s earlier', mob_id));
+    else
+        wcount('cleared_untracked');
+    end
+end;
+
+-- A mob newly appeared alive close to us. Any real spawn in view is a wave
+-- sample. What has to be ruled out is everything that only looks like one:
+--   zone-in / teleport   (whole area loads at once -> settle window)
+--   draw-distance pop-in (happens at the edge -> distance limit)
+--   scripted respawns    (launch module extras -> not on the wave)
+tracker.WaveOnSpawnSeen = function(self, mob_id, hr, zone_id, mx, mz, px, pz)
+    if hr < (self.WaveSettleUntil or 0) then wcount('s_settling'); return; end
+    if gYamlRespawn.IsScripted(zone_id, mob_id) then wcount('s_scripted'); return; end
+    if not (mx and px) then wcount('s_nopos'); return; end
+
+    -- A real spawn in view can be anywhere inside the draw range, but a
+    -- pop-in always happens near its edge, so only trust appearances well
+    -- inside it.
+    local d   = dist2d(px, pz, mx, mz);
+    local max = (gSettings and gSettings.wave_appear_max) or WAVE_NEAR_YALMS;
+    if d > max then wcount('s_far'); return; end
+
+    local result = wave:AddSample(zone_id, hr);
+    wnote('sample', string.format('spawn of %d seen %.0f yalms away: %s (wave phase %.2f)',
+        mob_id, d, result, hr % 30));
+    if result == 'locked' then
+        print(chat.header('Eggs') .. chat.message(
+            'Respawn wave locked for this zone. Respawn timers now include the wave.'));
+    elseif result == 'confirmed' then
+        print(chat.header('Eggs') .. chat.message(
+            'Saved respawn wave confirmed for this zone. Respawn timers now include the wave.'));
+    elseif result == 'regrid' then
+        print(chat.header('Eggs') .. chat.message(
+            'Respawn wave changed (server restart?). Relearning this zone.'));
+    end
+
+    local z = wave.Zones[zone_id];
+    if z and z.saved_rejected then
+        z.saved_rejected = nil;
+        print(chat.header('Eggs') .. chat.message(
+            'Saved wave for this zone did not match (server restarted?). Using the new one.'));
+    end
+    if z and z.locked and result ~= 'duplicate' and result ~= 'outlier' then
+        -- New locks are written at once; later refinements are throttled.
+        wave:Persist(zone_id, result == 'locked' or result == 'confirmed' or result == 'regrid');
+    end
 end;
 
 ------------------------------------------------------------
@@ -199,24 +567,42 @@ end;
 -- Also returns seconds until open and seconds until close.
 ------------------------------------------------------------
 tracker.GetNMWindowStatus = function(self, entry)
-    local elapsed  = os.time() - entry.tod_os;
-    local open_at  = entry.respawn_secs;
     local close_at = entry.window_secs;  -- 0 means no known close time
 
-    if elapsed < open_at then
-        -- Still in cooldown
-        local until_close = (close_at > 0) and (close_at - elapsed) or nil;
-        return 'waiting', open_at - elapsed, until_close;
+    -- A timed NM comes back through the wave like any other mob, so the window
+    -- edges are wave ticks. A lottery NM's cooldown is checked when its
+    -- placeholder dies, not on a tick, so it stays a plain timer.
+    local zone = tracker.NMOnWave(entry) and entry.zone_id or nil;
+
+    local until_open  = self:RepopRemaining(zone, entry.tod_os, entry.respawn_secs, entry.tod_wall);
+    local until_close = nil;
+    if close_at > 0 then
+        until_close = self:RepopRemaining(zone, entry.tod_os, close_at, entry.tod_wall);
     end
 
-    if close_at > 0 and elapsed >= close_at then
+    if until_open > 0 then
+        -- Still in cooldown
+        return 'waiting', until_open, until_close;
+    end
+
+    if until_close and until_close <= 0 then
         -- Past all windows
         return 'expired', 0, 0;
     end
 
     -- Window is open
-    local until_close = (close_at > 0) and (close_at - elapsed) or nil;
     return 'open', 0, until_close;
+end;
+
+-- True when an NM timer's window edges are set by the respawn wave: NMs that
+-- respawn on their own timer ('timed_spawn'). Cached on the entry.
+tracker.NMOnWave = function(entry)
+    if entry.on_wave == nil then
+        local rec = entry.nm_name and (gNmData:GetNM(entry.nm_name) or gNmData:GetNMAnyZone(entry.nm_name));
+        if not rec then return false; end     -- unknown yet: plain, and look again later
+        entry.on_wave = (rec.NMType == 'timed_spawn');
+    end
+    return entry.on_wave;
 end;
 
 ------------------------------------------------------------
@@ -229,6 +615,39 @@ tracker.PollEntities = function(self)
     local zone_id = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
     local dbg     = gSettings and gSettings.debug_mode;
 
+    -- Rebuilt every poll: which spawn indices are on screen right now, and
+    -- their status. Used by Tick() to confirm ID-tracked mobs have respawned.
+    local present = {};
+    self.CurrentZone = zone_id;
+
+    -- Respawn wave learning: sub-second clock and the player's position.
+    local wave_on = gSettings.wave_enabled ~= false;
+    local hr, px, pz = 0, nil, nil;
+    self.PollCount  = (self.PollCount or 0) + 1;
+    self.LastPollHr = wave.Now();
+    if wave_on then
+        hr = self.LastPollHr;
+        local pidx = AshitaCore:GetMemoryManager():GetParty():GetMemberTargetIndex(0);
+        if pidx and pidx > 0 then
+            px = em:GetLocalPositionX(pidx);
+            pz = em:GetLocalPositionZ(pidx);
+        end
+        -- Pin Ashita's clock to real time so a saved phase means something
+        -- in a later session.
+        wave:Calibrate(hr, os.time());
+
+        if self.WaveZone ~= zone_id then
+            self.WaveZone  = zone_id;
+            self.WaveSettleUntil = hr + 10;   -- the whole area is loading in
+            wave:LoadFile();                  -- another client may have saved this zone
+        end
+        -- A teleport or warp inside the zone loads a new area all at once.
+        if px and self.WaveLastPx and dist2d(px, pz, self.WaveLastPx, self.WaveLastPz) > 40 then
+            self.WaveSettleUntil = hr + 10;
+        end
+        self.WaveLastPx, self.WaveLastPz = px, pz;
+    end
+
     for idx = 1, 0x7FF do
         local name   = em:GetName(idx);
         local mob_id = em:GetServerId(idx);
@@ -239,9 +658,19 @@ tracker.PollEntities = function(self)
             local sp_index = mob_id % 1024;
             local last     = self.LastStatus[idx];
 
+            present[sp_index] = status;
+
             if last == nil then
-                -- First poll for this entity — record initial state
-                self.LastStatus[idx] = { s = status, id = mob_id, n = name, sp = sp_index, c = 1 };
+                -- First poll for this entity — record initial state.
+                -- Whether it is a mob is read now, while it is alive, because
+                -- the flags of a dead body are not guaranteed to stay the same.
+                local is_mob = bit.band(em:GetSpawnFlags(idx), 0x10) ~= 0;
+                self.LastStatus[idx] = { s = status, id = mob_id, n = name, sp = sp_index, c = 1, mob = is_mob };
+
+                -- A mob we watched die is present and alive again.
+                if wave_on and is_mob and not DEAD_STATUSES[status] then
+                    self:WaveOnSpawnSeen(mob_id, hr, zone_id, em:GetLocalPositionX(idx), em:GetLocalPositionZ(idx), px, pz);
+                end
             else
                 last.c = (last.c or 0) + 1;
 
@@ -263,6 +692,28 @@ tracker.PollEntities = function(self)
                             idx, name, mob_id, sp_index, last.s, status)));
                     end
                     self:CheckAndRecordDeath(idx, name, mob_id, sp_index, zone_id);
+                    -- Generic ID Respawn Tracking is driven only by a real
+                    -- death transition (not the despawn-out-of-range path),
+                    -- so a mob wandering off screen never starts its clock.
+                    self:RecordIdDeath(mob_id);
+
+                    -- Remember when it died. Wave learning does not need this,
+                    -- but a mob cannot really be alive again seconds later, so
+                    -- an instant dead->alive flip is a status glitch, not a spawn.
+                    wcount('deaths_seen');
+                    last.dead_hr = hr;
+                end
+
+                -- Dead -> alive without the slot ever going empty: the client
+                -- reused the entity in place. Still a real respawn.
+                if wave_on and last.mob and DEAD_STATUSES[last.s] and not DEAD_STATUSES[status] then
+                    if last.dead_hr and hr - last.dead_hr < 10 then
+                        wcount('appear_early');
+                    else
+                        wcount('appear_in_place');
+                        self:WaveOnSpawnSeen(mob_id, hr, zone_id, em:GetLocalPositionX(idx),
+                            em:GetLocalPositionZ(idx), px, pz);
+                    end
                 end
 
                 last.s  = status;
@@ -273,7 +724,10 @@ tracker.PollEntities = function(self)
             local last = self.LastStatus[idx];
             if last and last.id and last.id > 0 then
                 if DEAD_STATUSES[last.s] then
-                    -- Body of a dead mob cleared — timer already running, nothing to do
+                    -- Body of a dead mob cleared — timer already running.
+                    -- The despawn started 3s ago, which is when the server's
+                    -- respawn clock actually began.
+                    if wave_on then self:WaveOnBodyCleared(last.id, hr); end
                     if dbg then
                         local is_ph = gNmData:GetNMForPH(last.sp or 0);
                         if is_ph then
@@ -296,6 +750,8 @@ tracker.PollEntities = function(self)
             self.LastStatus[idx] = nil;
         end
     end
+
+    self.PresentIndex = present;
 end;
 
 ------------------------------------------------------------
@@ -366,6 +822,15 @@ tracker.CheckAndRecordDeath = function(self, entity_index, entity_name, mob_id, 
                     break;
                 end
             end
+        end
+
+        -- A data module (e.g. launch starter zones) can set the real respawn
+        -- for this exact spawn. That beats the imported value, which can be
+        -- stale or pre-module. Core-only values are left to the import data,
+        -- since NM scripts can override those at runtime.
+        local yr, _, yscripted, y_from_module = gYamlRespawn.Resolve(zone_id, mob_id);
+        if yr and yr > 0 and y_from_module and not yscripted then
+            ph_respawn = yr;
         end
 
         if dbg then
@@ -501,6 +966,72 @@ tracker.Tick = function(self)
     for _, key in ipairs(to_remove) do
         self:RemoveTimer(key);
     end
+
+    self:RefreshIdTargets();
+    for key, e in pairs(self.IdTargets) do
+        self:TickIdTarget(key, e, warn);
+    end
+end;
+
+------------------------------------------------------------
+-- ID Respawn Tracking, per-frame work
+------------------------------------------------------------
+
+-- Keep tracked mobs in step with the server data (also fixes entries saved
+-- before a module changed their respawn). Cheap: the yaml is cached, and this
+-- runs at most every 30 seconds.
+tracker.RefreshIdTargets = function(self)
+    local now_os = os.time();
+    if (now_os - (self.LastIdRefresh or 0)) < 30 then return; end
+    self.LastIdRefresh = now_os;
+
+    local keys = {};
+    for key in pairs(self.IdTargets) do keys[#keys + 1] = key; end
+    for _, key in ipairs(keys) do self:RefreshIdRespawn(key); end
+end;
+
+-- Early-warning alarm, then the "window is up" message, for one dead mob.
+tracker.AlarmIdTarget = function(self, key, e, warn)
+    local rem  = self:IdRemaining(e);    -- follows the wave when it is known
+    local play = gSettings.alarm_on_id_respawn ~= false;
+
+    if not e.alarm_fired and warn > 0 and rem <= warn and rem > 0 then
+        if play then gSounds:Play(gSettings.alarm_sound); end
+        e.alarm_fired = true;
+        self:SaveIdTarget(key);
+        return;
+    end
+
+    if rem > 0 or e.due_notified then return; end
+
+    if play and not e.alarm_fired then gSounds:Play(gSettings.alarm_sound); end
+    print(chat.header('Eggs') .. chat.message(string.format(
+        '[%s] respawn window is up.', e.name)));
+    e.alarm_fired  = true;
+    e.due_notified = true;
+    self:SaveIdTarget(key);
+end;
+
+-- A dead mob has respawned once we are in its zone and its spawn slot is
+-- occupied again by a living entity.
+tracker.ConfirmIdRespawn = function(self, key, e)
+    if self.CurrentZone ~= e.zone_id or not self.PresentIndex then return; end
+
+    local st = self.PresentIndex[e.sp_index];
+    if st == nil or DEAD_STATUSES[st] then return; end
+
+    e.state        = 'alive';
+    e.tod_os       = nil;
+    e.tod_wall     = nil;
+    e.alarm_fired  = false;
+    e.due_notified = false;
+    self:SaveIdTarget(key);
+end;
+
+tracker.TickIdTarget = function(self, key, e, warn)
+    if e.state ~= 'dead' or not e.tod_os then return; end
+    self:AlarmIdTarget(key, e, warn);
+    self:ConfirmIdRespawn(key, e);
 end;
 
 ------------------------------------------------------------

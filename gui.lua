@@ -121,6 +121,7 @@ gui._popup_open       = { true  };
 gui._nm_popup_open    = { true  };
 gui._settings_open    = { false };
 gui._browser_open     = { false };
+gui._id_open          = { false };
 
 ------------------------------------------------------------
 -- Initialize
@@ -131,6 +132,7 @@ gui.Initialize = function(self)
     self._detail_open[1]   = gSettings.ph_detail_visible or false;
     self._settings_open[1] = gSettings.settings_visible  or false;
     self._browser_open[1]  = gSettings.nm_browser_visible or false;
+    self._id_open[1]       = gSettings.id_visible or false;
 end;
 
 ------------------------------------------------------------
@@ -841,9 +843,17 @@ gui.RenderDetailWindow = function(self)
 
                 -- Respawn column
                 if timer then
-                    local rem = gTracker:GetRemaining(timer);
+                    -- Follows the wave when the zone's wave is known:
+                    -- green ~ = locked, dim ~? = saved unconfirmed, yellow = plain timer.
+                    local rem, kind = gTracker:GetRemaining(timer);
                     if rem > 0 then
-                        imgui.TextColored(C.YELLOW, fmt_time(rem));
+                        if kind == 'locked' then
+                            imgui.TextColored(C.OPEN, '~' .. fmt_time(rem));
+                        elseif kind == 'saved' then
+                            imgui.TextColored(C.DIM, '~' .. fmt_time(rem) .. '?');
+                        else
+                            imgui.TextColored(C.YELLOW, fmt_time(rem));
+                        end
                     else
                         imgui.TextColored(C.GREEN, 'Spawned');
                     end
@@ -1067,6 +1077,11 @@ gui.RenderSettingsWindow = function(self)
         gSettings.alarm_on_ph_spawn = on_p[1];
         gSaveSettings();
     end
+    local on_id = { gSettings.alarm_on_id_respawn ~= false };
+    if imgui.Checkbox('Alarm when an ID-tracked mob respawns', on_id) then
+        gSettings.alarm_on_id_respawn = on_id[1];
+        gSaveSettings();
+    end
     local warn = { gSettings.alarm_warning_secs or 0 };
     imgui.PushItemWidth(200);
     if imgui.SliderInt('##warn', warn, 0, 30, 'Warn %d sec early') then
@@ -1127,6 +1142,19 @@ gui.RenderSettingsWindow = function(self)
 
     imgui.Spacing();
 
+    -- ID Respawn Tracking: fallback respawn for /e mobs with no imported timer
+    local idr = { gSettings.id_default_respawn or 300 };
+    imgui.PushItemWidth(200);
+    if imgui.SliderInt('##iddefresp', idr, 30, 1800, 'ID default respawn: %d sec') then
+        gSettings.id_default_respawn = idr[1];
+        gSaveSettings();
+    end
+    imgui.PopItemWidth();
+    imgui.TextColored(C.DIM,
+        'Fallback respawn for /e mobs with no server-data timer (shown with ~).');
+
+    imgui.Spacing();
+
     -- Despawn offset: compensates for body-sit time between death packet and respawn clock
     local offset_val = { gSettings.despawn_offset or 10 };
     imgui.PushItemWidth(200);
@@ -1154,9 +1182,9 @@ gui.RenderSettingsWindow = function(self)
     -- Data management
     imgui.TextColored(C.GOLD, 'Data');
     imgui.Separator();
-    imgui.TextColored(C.DIM, 'Edit LSB_SERVER in addons/eggs/import.lua');
+    imgui.TextColored(C.DIM, 'NM data is built by tools/generate.py (Python).');
     imgui.PushStyleColor(ImGuiCol_Button, { 0.18, 0.28, 0.10, 1.0 });
-    if imgui.Button('Run Import') then
+    if imgui.Button('How to Import') then
         gSettings.settings_visible = false;
         gSaveSettings();
         local importer = require('import');
@@ -1584,9 +1612,224 @@ end;
 -- Order matters: tracker first so it's always on top,
 -- then detail/popups, then browser/settings.
 ------------------------------------------------------------
+------------------------------------------------------------
+-- Window 6: ID Respawn Tracking
+-- Generic (non-NM) mob respawn timers added with /e.
+------------------------------------------------------------
+-- Tooltip for the item drawn last. imgui.Text is not printf in this binding,
+-- so lines containing '%' (notes) are safe.
+local function hover_tip(lines)
+    if not imgui.IsItemHovered() then return; end
+    imgui.BeginTooltip();
+    for _, line in ipairs(lines) do imgui.Text(line); end
+    imgui.EndTooltip();
+end
+
+-- Notes are readable from the Mob / ID / Notes cells without widening the window.
+local function note_tip(note)
+    if note ~= '' then hover_tip({ note }); end
+end
+
+-- Respawn wave status for the current zone (see wave.lua).
+local function draw_wave_status()
+    if gSettings.wave_enabled == false then return; end
+
+    local wv = gTracker.Wave;
+    local line, locked = wv:Status(gTracker.CurrentZone, wv.Now());
+    imgui.TextColored(locked and C.OPEN or C.DIM, line);
+    if locked then return; end
+
+    hover_tip({
+        'Any mob you see spawn nearby counts. Three spawns lock the wave,',
+        'or two when they agree with a saved phase from an earlier session.',
+        'Wrong or stale? /eggs wave reset',
+    });
+end
+
+local function draw_id_toolbar()
+    imgui.PushStyleColor(ImGuiCol_Button, { 0.30, 0.10, 0.10, 1.0 });
+    if imgui.SmallButton(' Clear All ') then
+        local keys = {};
+        for k in pairs(gTracker.IdTargets) do keys[#keys + 1] = k; end
+        for _, k in ipairs(keys) do gTracker:RemoveIdTarget(k); end
+    end
+    imgui.PopStyleColor(1);
+    imgui.SameLine();
+    imgui.TextColored(C.DIM, '  target a mob + /e');
+
+    draw_wave_status();
+    imgui.Separator();
+end
+
+local function draw_id_status_cell(rem)
+    if rem == nil then
+        imgui.TextColored(C.GREEN, 'Alive');
+    elseif rem > 0 then
+        imgui.TextColored(C.RED, 'Dead');
+    else
+        imgui.TextColored(C.OPEN, 'Due');
+    end
+end
+
+-- Timer column. Alive: the mob's respawn timer. Dead: how long until it comes
+-- back. gTracker:IdRemaining follows the wave when it is known, otherwise it is
+-- the plain timer (which includes your despawn offset):
+--   wave locked        green  ~00:09   the tick it should pop on
+--   saved, unconfirmed dim    ~00:09?  same, from an earlier session
+--   wave not known     yellow 00:08    plain timer
+--   scripted           yellow 00:08    exact, it does not use the wave
+local function draw_id_timer_cell(e, rem, kind)
+    local suffix = e.is_estimate and ' ~' or '';
+    if rem == nil then
+        imgui.TextColored(C.DIM, fmt_time(e.respawn_secs) .. suffix);
+        return;
+    end
+
+    if kind == 'locked' then
+        imgui.TextColored(C.OPEN, rem > 0.5 and ('~' .. fmt_time(rem)) or 'now');
+        local tip = { 'Respawn timer + wave: it should pop on the next wave tick (+/-1s).' };
+        if not e.tod_exact then
+            tip[#tip + 1] = 'Despawn time is estimated (your despawn offset). Seeing the body vanish makes it exact.';
+        end
+        hover_tip(tip);
+        return;
+    end
+
+    if kind == 'saved' then
+        imgui.TextColored(C.DIM, (rem > 0.5 and ('~' .. fmt_time(rem)) or 'now') .. '?');
+        hover_tip({
+            'Predicted from a wave phase saved in an earlier session.',
+            'Two nearby spawns that agree will confirm it (turns green).',
+            'If the server restarted it will be dropped. /eggs wave reset clears it.',
+        });
+        return;
+    end
+
+    if rem > 0 then
+        imgui.TextColored(C.YELLOW, fmt_time(rem) .. suffix);
+    else
+        imgui.TextColored(C.OPEN, 'now');
+    end
+    if e.scripted then
+        hover_tip({
+            'Respawned by the launch module ~15s after it dies.',
+            'Not on the spawn wave, so this timer is exact.',
+        });
+        return;
+    end
+    hover_tip({
+        'Wave not known in this zone yet: plain timer using your despawn offset.',
+        'Any mob you see spawn nearby teaches it. Or set it: /eggs wave <0-59>',
+    });
+end
+
+local function draw_id_notes_cell(note)
+    if note == '' then
+        imgui.TextColored(C.EXPIRED, '-');
+        return;
+    end
+    imgui.TextColored(C.DIM, note);
+    note_tip(note);
+end
+
+local function draw_id_row(row, to_remove)
+    local e    = row.e;
+    local note = e.note or '';
+    local rem, kind;
+    if e.state == 'dead' and e.tod_os then rem, kind = gTracker:IdRemaining(e); end
+
+    imgui.PushStyleColor(ImGuiCol_Button, { 0.45, 0.10, 0.10, 1.0 });
+    if imgui.SmallButton('X##idrm_' .. row.k) then
+        to_remove[#to_remove + 1] = row.k;
+    end
+    imgui.PopStyleColor(1);
+    imgui.SameLine();
+    imgui.Text((e.name or '?') .. (note ~= '' and ' *' or ''));
+    note_tip(note);
+    imgui.NextColumn();
+
+    imgui.TextColored(C.DIM, fmt_id(e.mob_id));
+    note_tip(note);
+    imgui.NextColumn();
+
+    draw_id_status_cell(rem);
+    imgui.NextColumn();
+
+    draw_id_timer_cell(e, rem, kind);
+    imgui.NextColumn();
+
+    draw_id_notes_cell(note);
+    imgui.NextColumn();
+end
+
+local ID_COLUMNS = {
+    { 'Mob', 150 }, { 'ID', 62 }, { 'Status', 58 }, { 'Timer', 105 }, { 'Notes', 160 },
+};
+
+local function draw_id_table(sc)
+    -- Stable ordering by mob name
+    local rows = {};
+    for k, e in pairs(gTracker.IdTargets) do rows[#rows + 1] = { k = k, e = e }; end
+    table.sort(rows, function(a, b) return (a.e.name or '') < (b.e.name or ''); end);
+
+    imgui.Columns(#ID_COLUMNS, 'idcols', true);
+    for i, col in ipairs(ID_COLUMNS) do
+        imgui.SetColumnWidth(i - 1, math.floor(col[2] * sc));
+    end
+    for _, col in ipairs(ID_COLUMNS) do
+        imgui.TextColored(C.GOLD, col[1]);
+        imgui.NextColumn();
+    end
+    imgui.Separator();
+
+    local to_remove = {};
+    for _, row in ipairs(rows) do draw_id_row(row, to_remove); end
+    imgui.Columns(1);
+
+    for _, k in ipairs(to_remove) do gTracker:RemoveIdTarget(k); end
+end
+
+gui.RenderIDWindow = function(self)
+    if not gSettings.id_visible then return; end
+
+    local sc = gSettings.ui_scale or 1.0;
+    imgui.SetNextWindowSize({ math.floor(600 * sc), 220 }, ImGuiCond_FirstUseEver);
+    imgui.SetNextWindowPos(
+        { gSettings.id_pos[1], gSettings.id_pos[2] }, ImGuiCond_FirstUseEver);
+    push_style(0.05, 0.09, 0.05, 0.20, 0.45, 0.20);
+
+    if not imgui.Begin('ID Respawn Tracking##idresp', self._id_open, ImGuiWindowFlags_None) then
+        imgui.End();
+        imgui.PopStyleColor(4);
+        return;
+    end
+
+    self:_ApplyScale();
+    local p = { imgui.GetWindowPos() };
+    gSettings.id_pos = { p[1], p[2] };
+
+    draw_id_toolbar();
+
+    if next(gTracker.IdTargets) == nil then
+        imgui.Spacing();
+        imgui.TextColored(C.DIM, '  Nothing tracked. Target a mob and type /e');
+    else
+        draw_id_table(sc);
+    end
+
+    self:_PopScale();
+    imgui.End();
+    imgui.PopStyleColor(4);
+    if not self._id_open[1] then
+        gSettings.id_visible = false;
+        gSaveSettings();
+    end
+end;
+
 gui.Render = function(self)
     gTracker:Tick();
     self:RenderTrackerWindow();
+    self:RenderIDWindow();
     self:RenderDetailWindow();
     self:RenderPHPopup();
     self:RenderNMPopup();

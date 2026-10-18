@@ -46,6 +46,12 @@ local default_settings = {
     print_window_time  = false,  -- print real-world window open time when a PH or NM death is recorded
     notify_default     = false,  -- automatically set a chat notify when recording a death
     notify_default_mins = 60,   -- how many minutes before eligibility to send the chat notify
+    -- ID Respawn Tracking (generic non-NM mob respawn timers)
+    id_tracked          = {},    -- [tostring(mob_id)] = saved timer state
+    id_visible          = false, -- ID Respawn window shown
+    id_pos              = { 150, 400 },
+    id_default_respawn  = 300,   -- fallback respawn (s) for /e mobs with no known timer
+    alarm_on_id_respawn = true,  -- play the alarm when an ID-tracked mob is about to respawn
 };
 
 -- Recursively serialize a Lua value to a pretty-printed string.
@@ -140,6 +146,7 @@ local gui      = require('gui');
 local tracker  = require('tracker');
 local sounds   = require('sounds');
 local importer = require('import');
+local yaml_respawn = require('yaml_respawn');
 
 ------------------------------------------------------------
 -- Globals
@@ -155,6 +162,13 @@ gNmData       = nm_data;
 gTracker      = tracker;
 gSounds       = sounds;
 gGui          = gui;
+gYamlRespawn  = yaml_respawn;   -- real respawn times from the server's yaml + modules
+
+-- Learned respawn waves are kept between sessions, shared by every client
+-- using this Ashita install. See wave.lua for why they can be trusted.
+tracker.Wave.SavePath = string.format('%sconfig/addons/%s/wave_phases.lua',
+    AshitaCore:GetInstallPath(), addon.name);
+tracker.Wave:LoadFile();
 
 -- Load NM data for the player's current zone.
 local function reload_zone_data()
@@ -185,6 +199,129 @@ local function cmd_help()
     print(chat.header('Eggs') .. chat.message('/eggs tod <NM Name> HH:MM:SS MM/DD/YYYY  Record NM death at specific date'));
     print(chat.header('Eggs') .. chat.message('/eggs <NM Name>       Open PH detail (works for any zone)'));
     print(chat.header('Eggs') .. chat.message('/eggs open <NM Name>  Gives the time/date for specified NM\'s window'));
+    print(chat.header('Eggs') .. chat.message('/e  [secs] [note]     Track respawn of the mob you are targeting (ID Respawn window)'));
+    print(chat.header('Eggs') .. chat.message('/e  <note text>       Add/replace a note on the targeted mob  (/e - clears it)'));
+    print(chat.header('Eggs') .. chat.message('/eggs id             Show/hide the ID Respawn Tracking window'));
+    print(chat.header('Eggs') .. chat.message('/eggs id clear [name] Remove one / all ID respawn timers'));
+    print(chat.header('Eggs') .. chat.message('/eggs wave <0-59>    Set this zone\'s wave by hand: <n> = ticks at :<n> and :<n+30> on your PC clock'));
+    print(chat.header('Eggs') .. chat.message('/eggs wave reset     Forget the wave for this zone, saved copy too ("reset all" = every zone)'));
+    print(chat.header('Eggs') .. chat.message('/eggs wave off|on    Turn wave prediction off / on'));
+    print(chat.header('Eggs') .. chat.message('/eggs wave debug     Diagnostic report (add "on"/"off" to print each step live)'));
+end
+
+-- /eggs wave <0-59> | reset [all] | off | on | debug [on|off]
+-- The server spawns mobs in 30s waves. Eggs learns each zone's wave by
+-- timing respawns it sees, then predicts repops in the ID Respawn window.
+-- A number sets the wave by hand: 15 means ticks at :15 and :45.
+local function cmd_wave(args)
+    local sub  = (args[2] or ''):lower();
+    local zone = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local w    = gTracker.Wave;
+
+    if sub == 'debug' then
+        local arg = (args[3] or ''):lower();
+        if arg == 'on' or arg == 'off' then
+            gSettings.wave_debug = (arg == 'on');
+            save_settings();
+            print(chat.header('Eggs') .. chat.message('Wave debug messages ' .. arg .. '. Each step is printed as it happens.'));
+            return;
+        end
+
+        local function say(fmt, ...) print(chat.header('Eggs') .. chat.message(string.format(fmt, ...))); end
+        local now = w.Now();
+
+        -- Which folder is running, and where time comes from.
+        say('--- wave debug ---');
+        say('Loaded from: %s   (v%s)', tostring(addon.path), tostring(addon.version));
+        local ok, c = pcall(function() return ashita.time.clock(); end);
+        say('Clock: %s   wave enabled: %s   live debug: %s',
+            (ok and c and c.ms) and 'ashita.time.clock (ms)' or 'os.time fallback (1s resolution!)',
+            tostring(gSettings.wave_enabled ~= false), tostring(gSettings.wave_debug == true));
+
+        -- Is the poll loop running?
+        local secs_since_poll = now - (gTracker.LastPollHr or 0);
+        say('Polls: %d   last poll %.1fs ago   zoning flag: %s   zone: %d',
+            gTracker.PollCount or 0, secs_since_poll, tostring(gZoning), zone);
+
+        -- Counters, in the order events happen.
+        local st = gTracker.WaveStats or {};
+        local order = { 'deaths_seen', 'cleared', 'cleared_untracked',
+                        'appear_in_place', 'appear_early',
+                        's_settling', 's_scripted', 's_far', 's_nopos', 'sample' };
+        local parts = {};
+        for _, k in ipairs(order) do parts[#parts + 1] = string.format('%s=%d', k, st[k] or 0); end
+        say('Counters: %s', table.concat(parts, '  '));
+
+        local settle = (gTracker.WaveSettleUntil or 0) - now;
+        say('Settle window: %s', settle > 0 and string.format('%.0fs left (zoned/teleported)', settle) or 'idle');
+
+        -- Wall-clock calibration and what is saved for this zone.
+        local off = w.WallOffset();
+        say('Wall clock: %s   saving: %s', off and string.format('calibrated (bounds %.0f ms)',
+            (w.Wall.hi - w.Wall.lo) * 1000) or 'not calibrated yet (saved phases unusable)',
+            tostring(gSettings.wave_save ~= false));
+        local sv = w.Saved[zone];
+        if sv then
+            say('Saved for zone %d: phase %.2f, %.1f h ago, %d spawns', zone, sv.p,
+                (os.time() - sv.t) / 3600, sv.n or 0);
+        else
+            say('Nothing saved for zone %d.', zone);
+        end
+
+        -- What the wave learner holds for this zone.
+        local z = w.Zones[zone];
+        if z and #z.samples > 0 then
+            local ph = {};
+            for _, s in ipairs(z.samples) do ph[#ph + 1] = string.format('%.1f', s.p); end
+            say('Zone samples (phase, s): %s', table.concat(ph, ', '));
+            say('%s', (w:Status(zone, now)));
+        else
+            say('No respawn samples recorded in this zone yet.');
+        end
+
+        -- Recent events.
+        local log = gTracker.WaveLog or {};
+        for i = math.max(1, #log - 7), #log do say('  %s', log[i]); end
+        return;
+    elseif sub == 'reset' then
+        if (args[3] or ''):lower() == 'all' then
+            w:Reset();
+            print(chat.header('Eggs') .. chat.message('Every learned and saved wave forgotten. They will relearn as mobs respawn.'));
+        else
+            w:Reset(zone);
+            print(chat.header('Eggs') .. chat.message('Wave forgotten for this zone, including its saved copy. It will relearn as mobs respawn.'));
+        end
+        return;
+    elseif sub == 'off' or sub == 'on' then
+        gSettings.wave_enabled = (sub == 'on');
+        save_settings();
+        print(chat.header('Eggs') .. chat.message('Wave prediction ' .. sub .. '.'));
+        return;
+    end
+
+    -- /eggs wave <seconds>: the user states the wave. 15 = ticks at :15 and :45.
+    local secs = tonumber(sub);
+    if secs then
+        if secs < 0 or secs >= 60 then
+            print(chat.header('Eggs') .. chat.error('Use a number from 0 to 59 (seconds on your PC clock).'));
+            return;
+        end
+        if not w:SetManual(zone, secs, w.Now()) then
+            print(chat.header('Eggs') .. chat.error(
+                'The clock is still calibrating (needs a few seconds after loading). Try again shortly.'));
+            return;
+        end
+        w:Persist(zone, true);
+        local function sec(n) return (n == math.floor(n)) and string.format('%02d', n) or string.format('%05.2f', n); end
+        local other = (secs + 30) % 60;
+        print(chat.header('Eggs') .. chat.message(string.format(
+            'Wave set: ticks at :%s and :%s of every minute (PC clock). Real spawns will correct it if it is wrong.',
+            sec(math.min(secs, other)), sec(math.max(secs, other)))));
+        return;
+    end
+
+    print(chat.header('Eggs') .. chat.message(
+        'Usage: /eggs wave <0-59> | reset [all] | on | off | debug [on|off]'));
 end
 
 local function cmd_show()
@@ -265,6 +402,14 @@ local function cmd_debug()
     print(chat.header('Eggs') .. chat.message(string.format(
         'Lua heap: %.1f KB | Active timers: %d | Tracked NMs: %d | Entity cache: %d slots',
         mem_kb, timer_count, track_count, cache_count)));
+
+    -- Zoning gate state: if gZoning is stuck true, polling never runs.
+    local pidx = AshitaCore:GetMemoryManager():GetParty():GetMemberTargetIndex(0);
+    local pname = pidx and pidx > 0 and AshitaCore:GetMemoryManager():GetEntity():GetName(pidx) or nil;
+    print(chat.header('Eggs') .. chat.message(string.format(
+        'Zoning gate: gZoning=%s player_idx=%d player_name=%s zone=%d',
+        tostring(gZoning), pidx or -1, pname or 'nil',
+        AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) or -1)));
 end
 
 -- /eggs <NM Name> deathtime
@@ -539,6 +684,165 @@ local function cmd_tod(args)
     gTracker:RecordDeath('nm', nm.Name, nil, 0, zone_id, window_min, window_max, tod_os);
 end
 
+-- /e  (also /eggs e)
+-- Track the mob you are targeting in the ID Respawn Tracking window.
+--   /e                      track it
+--   /e 240                  track it with a manual 240s respawn
+--   /e spawned to the north  attach a free-text note (quotes optional)
+--   /e 240 spawned north     both
+--   /e -                     clear the note
+
+-- Splits /e arguments into a manual respawn override (a leading integer >= 10)
+-- and a free-text note with one layer of surrounding quotes removed.
+local function parse_track_args(args)
+    local override, note_start = nil, 1;
+    local first = tostring(args[1] or '');
+    if first:match('^%d+$') and tonumber(first) >= 10 then
+        override, note_start = math.floor(tonumber(first)), 2;
+    end
+
+    local note = table.concat(args, ' ', note_start):match('^%s*(.-)%s*$');
+    note = note:gsub('^"(.*)"$', '%1'):gsub("^'(.*)'$", '%1');
+    return override, note;
+end
+
+-- Server id and name of the main target. On failure returns nil and the
+-- message to print.
+local function targeted_mob()
+    local mm = AshitaCore:GetMemoryManager();
+    local ti = mm:GetTarget():GetTargetIndex(0);
+    if not ti or ti == 0 then
+        return nil, '/e: no target - target a mob first.';
+    end
+
+    local em     = mm:GetEntity();
+    local mob_id = em:GetServerId(ti);
+    local name   = em:GetName(ti);
+    if not mob_id or mob_id == 0 or not name or name == '' then
+        return nil, '/e: target is not a valid mob.';
+    end
+    return mob_id, name;
+end
+
+-- /e on a mob that is already tracked: apply a manual respawn and/or a note.
+-- Manual respawn values are never auto-corrected.
+local function update_tracked_mob(key, mob_id, name, override, note)
+    if override then
+        local e = gTracker.IdTargets[key];
+        e.respawn_secs = override;
+        e.manual       = true;
+        e.is_estimate  = false;
+        gTracker:SaveIdTarget(key);
+        print(chat.header('Eggs') .. chat.message(string.format(
+            '%s: respawn set to %s (manual).', name, gTracker:FormatTime(override))));
+    end
+
+    if note == '' then
+        print(chat.header('Eggs') .. chat.message('Already tracking respawn for ' .. name .. '.'));
+        return;
+    end
+
+    local clear = (note == '-');
+    gTracker:SetIdNote(mob_id, clear and '' or note);
+    print(chat.header('Eggs') .. chat.message(clear
+        and ('Note cleared for ' .. name .. '.')
+        or  string.format('Note set for %s: %s', name, note)));
+end
+
+local function respawn_origin(override, src, scripted)
+    if override then return ' (manual)'; end
+    if not (src and src:sub(1, 5) == 'yaml:') then return ''; end
+    return scripted and ' (module, scripted respawn)' or ' (from server data)';
+end
+
+local function cmd_track_id(args)
+    local override, note = parse_track_args(args or {});
+    local clear_note = (note == '-');
+
+    local mob_id, name = targeted_mob();
+    if not mob_id then
+        print(chat.header('Eggs') .. chat.error(name));   -- name is the error text here
+        return;
+    end
+
+    local key = tostring(mob_id);
+    if gTracker.IdTargets[key] then
+        update_tracked_mob(key, mob_id, name, override, note);
+        return;
+    end
+
+    local zone_id  = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local sp_index = mob_id % 1024;
+
+    -- The server's own yaml (core + enabled modules) is the authority; the
+    -- per-spawn respawn that tools/generate.py wrote fills in when it does not say.
+    local known = gNmData:GetMobRespawn(sp_index);
+    local src   = known and 'import' or nil;
+    local yaml_r, yaml_src, scripted = gYamlRespawn.Resolve(zone_id, mob_id);
+    if yaml_r ~= nil then known, src = yaml_r, 'yaml:' .. tostring(yaml_src); end
+
+    local respawn = override or known or (gSettings.id_default_respawn or 300);
+    local is_est  = (override == nil) and (known == nil);
+    if gSettings.debug_mode then
+        print(chat.header('Eggs') .. chat.message(string.format(
+            '/e: %s zone=%d sp=%d respawn=%s src=%s', name, zone_id, sp_index,
+            tostring(known or 'default'), src or 'none')));
+    end
+
+    gTracker:AddIdTarget(mob_id, sp_index, name, zone_id, respawn, is_est,
+        (not clear_note) and note or '', scripted and true or false, override ~= nil);
+
+    -- Surface the window on first use
+    gSettings.id_visible = true;
+    if gGui then gGui._id_open[1] = true; end
+    save_settings();
+
+    print(chat.header('Eggs') .. chat.message(string.format(
+        'Tracking respawn for %s [%s] - %s%s%s.%s',
+        name, tostring(mob_id % 1000), gTracker:FormatTime(respawn),
+        is_est and ' (est)' or '', respawn_origin(override, src, scripted),
+        (note ~= '' and not clear_note) and ('  Note: ' .. note) or '')));
+end
+
+-- Removes every ID respawn timer (or the one named `target`). Returns the
+-- display name that was removed, or nil if none matched.
+local function clear_id_timers(target)
+    if target == '' or target:lower() == 'all' then
+        local n = 0;
+        for k in pairs(gTracker.IdTargets) do
+            gTracker.IdTargets[k] = nil;
+            n = n + 1;
+        end
+        gSettings.id_tracked = {};
+        save_settings();
+        print(chat.header('Eggs') .. chat.message('Cleared ' .. n .. ' ID respawn timer(s).'));
+        return;
+    end
+
+    local wanted = target:lower();
+    for k, e in pairs(gTracker.IdTargets) do
+        if (e.name or ''):lower() == wanted then
+            gTracker:RemoveIdTarget(k);
+            print(chat.header('Eggs') .. chat.message('Stopped tracking ' .. e.name .. '.'));
+            return;
+        end
+    end
+    print(chat.header('Eggs') .. chat.message('Not tracking: ' .. target));
+end
+
+-- /eggs id                 Toggle the ID Respawn Tracking window
+-- /eggs id clear [<name>]  Remove one (by name) or all ID respawn timers
+local function cmd_id(args)
+    if (args[2] or ''):lower() == 'clear' then
+        clear_id_timers(table.concat(args, ' ', 3):match('^%s*(.-)%s*$'));
+        return;
+    end
+
+    gSettings.id_visible = not gSettings.id_visible;
+    if gSettings.id_visible and gGui then gGui._id_open[1] = true; end
+    save_settings();
+end
+
 -- /eggs <NM Name> (fallback)
 -- Opens the PH detail window for a named NM.
 local function cmd_detail(args)
@@ -623,6 +927,9 @@ local command_handlers = {
     notify    = cmd_notify,
     open      = cmd_open,
     tod       = cmd_tod,
+    e         = function(args) table.remove(args, 1); cmd_track_id(args); end,
+    id        = function(args) cmd_id(args); end,
+    wave      = function(args) cmd_wave(args); end,
 };
 
 local function handle_command(args)
@@ -665,7 +972,18 @@ end);
 -- On command: route /eggs commands to the handler.
 ashita.events.register('command', 'eggs_command', function(e)
     local args = e.command:args();
-    if #args == 0 or args[1]:lower() ~= '/eggs' then return; end
+    if #args == 0 then return; end
+    local c = args[1]:lower();
+
+    -- /e is a standalone shortcut for "track the mob I'm targeting".
+    if c == '/e' then
+        e.blocked = true;
+        table.remove(args, 1);
+        cmd_track_id(args);
+        return;
+    end
+
+    if c ~= '/eggs' then return; end
     e.blocked = true;
     table.remove(args, 1);
     handle_command(args);
@@ -676,7 +994,13 @@ ashita.events.register('d3d_present', 'eggs_present', function()
     -- Detect zoning by checking if the player entity name has cleared.
     -- The name goes blank the moment a zone transition begins.
     local em          = AshitaCore:GetMemoryManager():GetEntity();
-    local player_name = em:GetName(0x400);
+    -- The local player's entity index is not a fixed slot (it varies by
+    -- client/session), so ask the party table for it instead of hardcoding
+    -- 0x400. During a zone transition this returns 0 / a blank name, which is
+    -- exactly the signal we want.
+    local party       = AshitaCore:GetMemoryManager():GetParty();
+    local player_idx  = party:GetMemberTargetIndex(0);
+    local player_name = (player_idx and player_idx > 0) and em:GetName(player_idx) or nil;
     local is_zoning   = (not player_name or player_name == '');
 
     if is_zoning and not gZoning then

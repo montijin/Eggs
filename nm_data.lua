@@ -16,9 +16,10 @@ local chat = require('chat');
 local nm_data = {};
 
 -- Current zone state
-nm_data.CurrentZone  = -1;
-nm_data.NMs          = {};   -- [nm_name] = entry, current zone only
-nm_data.PHLookup     = {};   -- [sp_index] = nm_name, current zone only
+nm_data.CurrentZone   = -1;
+nm_data.NMs           = {};  -- [nm_name] = entry, current zone only
+nm_data.PHLookup      = {};  -- [sp_index] = nm_name, current zone only
+nm_data.RespawnByIndex = {}; -- [sp_index] = respawn_secs, generic mobs, current zone only
 
 -- All-zones browser cache (populated by LoadAllForBrowser)
 nm_data.AllNMs       = {};   -- sorted flat list for the browser UI (excludes loot_only)
@@ -33,9 +34,10 @@ nm_data.AllNMsLoaded = false;
 ------------------------------------------------------------
 nm_data.Load = function(self, zone)
     if zone == self.CurrentZone then return; end
-    self.CurrentZone = zone;
-    self.NMs         = {};
-    self.PHLookup    = {};
+    self.CurrentZone    = zone;
+    self.NMs            = {};
+    self.PHLookup       = {};
+    self.RespawnByIndex = {};
     if zone == 0 then return; end
 
     local path = addon.path .. 'data\\' .. zone .. '.lua';
@@ -51,13 +53,19 @@ nm_data.Load = function(self, zone)
     if not ok or type(result) ~= 'table' then return; end
 
     for nm_name, entry in pairs(result) do
-        self.NMs[nm_name] = entry;
-        -- Index each PH by its spawn-point index so we can look up
-        -- "which NM does this PH belong to?" in O(1) during entity polling
-        if entry.PHs then
-            for _, ph in ipairs(entry.PHs) do
-                if ph.Index and ph.Index > 0 then
-                    self.PHLookup[ph.Index] = nm_name;
+        -- '__resp' is not an NM: it's the generic mob respawn map
+        -- ([sp_index] = respawn_secs) used by the ID Respawn Tracker.
+        if nm_name == '__resp' then
+            self.RespawnByIndex = entry;
+        else
+            self.NMs[nm_name] = entry;
+            -- Index each PH by its spawn-point index so we can look up
+            -- "which NM does this PH belong to?" in O(1) during entity polling
+            if entry.PHs then
+                for _, ph in ipairs(entry.PHs) do
+                    if ph.Index and ph.Index > 0 then
+                        self.PHLookup[ph.Index] = nm_name;
+                    end
                 end
             end
         end
@@ -106,27 +114,30 @@ nm_data.LoadAllForBrowser = function(self)
                        or ('Zone ' .. zone_id);
 
         for nm_name, entry in pairs(result) do
-            local rec = {
-                Name           = nm_name,
-                ZoneId         = zone_id,
-                ZoneName       = zone_name,
-                NMType         = entry.NMType         or 'unknown',
-                Chance         = entry.Chance         or 0,
-                Cooldown       = entry.Cooldown       or 0,
-                WindowMin      = entry.WindowMin      or 0,
-                WindowMax      = entry.WindowMax      or 0,
-                WindowInterval = entry.WindowInterval or 0,
-                WindowCount    = entry.WindowCount    or 0,
-                NMMobId        = entry.NMMobId        or 0,
-                PHs            = entry.PHs            or {},
-                Loot           = entry.Loot           or {},
-            };
-            -- loot_only NMs (popped/event mobs) are searchable via AllNMsByName
-            -- but are excluded from AllNMs so they don't clutter the browser list
-            if entry.NMType ~= 'loot_only' then
-                self.AllNMs[#self.AllNMs + 1] = rec;
+            -- Skip the generic mob respawn map; it's not an NM entry.
+            if nm_name ~= '__resp' then
+                local rec = {
+                    Name           = nm_name,
+                    ZoneId         = zone_id,
+                    ZoneName       = zone_name,
+                    NMType         = entry.NMType         or 'unknown',
+                    Chance         = entry.Chance         or 0,
+                    Cooldown       = entry.Cooldown       or 0,
+                    WindowMin      = entry.WindowMin      or 0,
+                    WindowMax      = entry.WindowMax      or 0,
+                    WindowInterval = entry.WindowInterval or 0,
+                    WindowCount    = entry.WindowCount    or 0,
+                    NMMobId        = entry.NMMobId        or 0,
+                    PHs            = entry.PHs            or {},
+                    Loot           = entry.Loot           or {},
+                };
+                -- loot_only NMs (popped/event mobs) are searchable via AllNMsByName
+                -- but are excluded from AllNMs so they don't clutter the browser list
+                if entry.NMType ~= 'loot_only' then
+                    self.AllNMs[#self.AllNMs + 1] = rec;
+                end
+                self.AllNMsByName[nm_name] = rec;
             end
-            self.AllNMsByName[nm_name] = rec;
         end
 
         ::continue::
@@ -150,6 +161,19 @@ end;
 nm_data.GetNMForPH = function(self, sp_index)
     if not sp_index or sp_index <= 0 then return nil; end
     return self.PHLookup[sp_index];
+end;
+
+------------------------------------------------------------
+-- GetMobRespawn
+-- Returns the known respawn time (seconds) for a generic mob
+-- by its spawn-point index in the current zone, or nil if the
+-- generator wrote no respawn for it (scripted / special spawn).
+------------------------------------------------------------
+nm_data.GetMobRespawn = function(self, sp_index)
+    if not sp_index or sp_index <= 0 then return nil; end
+    local rt = self.RespawnByIndex and self.RespawnByIndex[sp_index];
+    if rt and rt > 0 then return rt; end
+    return nil;
 end;
 
 ------------------------------------------------------------
