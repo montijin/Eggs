@@ -4,7 +4,7 @@
 **Version:** 1.0  
 **License:** MIT  
 
-An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timers in Final Fantasy XI. Eggs monitors placeholder mob deaths, tracks respawn countdowns, and alerts you when an NM window opens or a PH respawns.
+An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timers in Final Fantasy XI. Eggs monitors placeholder mob deaths, tracks respawn countdowns, and alerts you when an NM window opens or a PH is due to respawn.
 
 ---
 
@@ -22,7 +22,7 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
   - `Timed Lottery` — Spawns off PH death with a % chance; has a cooldown after its own death
   - `True Lottery` — Same as Timed Lottery but no cooldown; can pop immediately after dying
   - `Timed Spawn` — No placeholder; respawns after a set time window after death
-- **Alarm System** — Configurable `.wav` alarms with multiple sounds and early-warning timer
+- **Alarm System** — Configurable `.wav` alarms with multiple sounds and early-warning timer (like an egg timer, wow)
 - **Session Persistence** — Timers survive game restarts using real-world timestamps
 
 ---
@@ -39,13 +39,13 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
 
 ## Setup: Importing NM Data
 
-Eggs reads NM, placeholder and loot data from the Phoenix server workspace. The data files in `addons/eggs/data/` are produced by `tools/generate.py`, which replaced the old in-game importer when Phoenix moved mob data out of SQL and `phList` Lua into per-zone YAML.
+Eggs reads NM, placeholder and loot data from the Phoenix Repo. The data files in `addons/eggs/data/` are produced by `tools/generate.py`, which replaced the old in-game importer when Phoenix moved mob data out of SQL and `phList` Lua into per-zone YAML.
 
 Requires Python 3 and PyYAML (`python -m pip install pyyaml`).
 
 1. From a terminal, run the generator against your Phoenix checkout:
    ```
-   python addons/eggs/tools/generate.py --repo C:\Phoenix-Workspace
+   python addons/eggs/tools/generate.py --repo Drive:\YourPhoenixInstall
    ```
    It takes about 20 seconds. Add `--zone <id>` to rebuild a single zone.
 2. In game, reload the addon:
