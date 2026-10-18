@@ -1,10 +1,12 @@
 # Eggs — NM Placeholder Tracker for Ashita v4
 
 **Author:** Monti  
-**Version:** 1.0  
+**Version:** 1.03  
 **License:** MIT  
 
 An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timers in Final Fantasy XI. Eggs monitors placeholder mob deaths, tracks respawn countdowns, and alerts you when an NM window opens or a PH is due to respawn.
+
+![Eggs tracker and placeholder detail windows](images/Eggs-UI.webp)
 
 ---
 
@@ -29,7 +31,7 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
 
 ## Installation
 
-1. Copy the `eggs` folder to `Ashita/addons/eggs/`
+1. Copy the `eggs` folder to `Ashita/addons/eggs/`. The NM data is already included in `data/`, so there is nothing to import.
 2. Load in-game:
    ```
    /addon load eggs
@@ -37,7 +39,9 @@ An Ashita v4 addon for tracking Notorious Monster placeholders and respawn timer
 
 ---
 
-## Setup: Importing NM Data
+## Updating the NM Data (optional)
+
+The release ships with the data already built from the Phoenix server, so most players can skip this section. You only need it if the server data changes or you run your own server.
 
 Eggs reads NM, placeholder and loot data from the Phoenix Repo. The data files in `addons/eggs/data/` are produced by `tools/generate.py`, which replaced the old in-game importer when Phoenix moved mob data out of SQL and `phList` Lua into per-zone YAML.
 

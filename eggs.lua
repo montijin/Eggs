@@ -6,7 +6,7 @@
 addon.name    = 'Eggs';
 addon.author  = 'Monti';
 addon.desc    = 'NM Placeholder tracker and respawn timer';
-addon.version = '1.01';
+addon.version = '1.03';
 
 require('common');
 local chat     = require('chat');
